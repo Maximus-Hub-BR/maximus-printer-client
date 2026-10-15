@@ -49,7 +49,7 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "leorobaskievicz",
+      "owner": "Maximus-Hub-BR",
       "repo": "maximus-printer-client",
       "releaseType": "release"
     },
