@@ -9,3 +9,7 @@ node_modules/
 # SO
 .DS_Store
 Thumbs.db
+
+# particularidades de cada dev — ver a seção 4 do CLAUDE.md
+CLAUDE.local.md
+.claude/settings.local.json
