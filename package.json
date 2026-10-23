@@ -6,9 +6,9 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node src/fila-impressao.test.js && node src/pdf-etiqueta.test.js && node src/preparo-impressora.test.js",
+    "test": "node src/fila-impressao.test.js && node src/pdf-etiqueta.test.js && node src/preparo-impressora.test.js && node src/impressao-cups.test.js",
     "build:win": "electron-builder --win --x64",
-    "build:mac": "electron-builder --mac",
+    "build:mac": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --universal",
     "packagePublish": "electron-builder --win --x64 --publish always"
   },
   "dependencies": {
@@ -36,9 +36,14 @@
       "icon": "assets/icon.ico"
     },
     "mac": {
-      "target": "dmg",
+      "identity": null,
+      "gatekeeperAssess": false,
       "icon": "assets/icon.icns",
-      "category": "public.app-category.utilities"
+      "category": "public.app-category.utilities",
+      "target": [
+        { "target": "dmg", "arch": ["universal"] },
+        { "target": "zip", "arch": ["universal"] }
+      ]
     },
     "nsis": {
       "oneClick": true,

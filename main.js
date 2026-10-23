@@ -44,8 +44,11 @@ app.whenReady().then(async () => {
   axios = require('axios')
   mqtt  = require('mqtt')
 
-  // pdf-to-printer só funciona em produção com PDF disponível no sistema
-  try { pdfPrint = require('pdf-to-printer') } catch (_) { pdfPrint = null }
+  // pdf-to-printer carrega em qualquer sistema e só recusa na hora de
+  // imprimir. No Mac esse require "dava certo" e o `lp` nunca era chamado.
+  if (process.platform === 'win32') {
+    try { pdfPrint = require('pdf-to-printer') } catch (_) { pdfPrint = null }
+  }
 
   app.setLoginItemSettings({ openAtLogin: true })
 
@@ -281,6 +284,13 @@ function registrar (mensagem) {
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
 const { scriptPowerShell, comandoPowerShell } = require('./src/envio-raw-windows')
 const { criarPreparoDeImpressora, comandoDesligarBidi } = require('./src/preparo-impressora')
+const {
+  canalDePdf,
+  canalDeZpl,
+  argumentosDePdf,
+  argumentosDeZplRaw,
+  interpretarLpstat,
+} = require('./src/impressao-cups')
 
 /**
  * O preparo da impressora — `src/preparo-impressora.js`.
@@ -516,25 +526,36 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
 
   const comecou = Date.now()
   try {
-    if (pdfPrint) {
+    if (canalDePdf(process.platform) === 'sumatra' && pdfPrint) {
       await pdfPrint.print(file, { printer: printerName, silent: true, scale: escalaSumatra })
-      /*
-       * ⚠️ Este número é o que separa "o software está lento" de "a
-       * impressora está lenta". Ele mede até o SPOOLER aceitar — o papel sai
-       * depois, no ritmo do equipamento. Sem ele, as duas coisas viram a
-       * mesma queixa.
-       */
-      registrar(`[pdf] ${printerName}: ${lista.length} documento(s) entregues ao spooler em ${Date.now() - comecou} ms (escala ${escalaSumatra})`)
     } else {
-      // Fallback macOS/Linux via CUPS (lp)
-      const { execSync } = require('child_process')
-      const scaleArg = escalaSumatra === 'fit' ? '-o fit-to-page '
-                     : escalaSumatra === 'noscale' ? '-o scaling=100 '
-                     : ''
-      execSync(`lp ${scaleArg}-d "${printerName}" "${file}"`)
+      // macOS/Linux: CUPS. O nome da fila vai como argumento, nunca dentro
+      // de uma string de shell — aspas no nome quebrariam o comando.
+      entregarAoCups(argumentosDePdf({
+        impressora: printerName,
+        arquivo: file,
+        escala: escalaSumatra,
+      }))
     }
+    /*
+     * ⚠️ Este número é o que separa "o software está lento" de "a
+     * impressora está lenta". Ele mede até o SPOOLER aceitar — o papel sai
+     * depois, no ritmo do equipamento. Sem ele, as duas coisas viram a
+     * mesma queixa.
+     */
+    registrar(`[pdf] ${printerName}: ${lista.length} documento(s) entregues ao spooler em ${Date.now() - comecou} ms (escala ${escalaSumatra})`)
   } finally {
     try { require('fs').unlinkSync(file) } catch (_) {}
+  }
+}
+
+function entregarAoCups (args) {
+  const { execFileSync } = require('child_process')
+  try {
+    execFileSync('lp', args, { timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (e) {
+    const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
+    throw new Error(`CUPS recusou o trabalho (${args.join(' ')}): ${detalhe.slice(0, 300)}`)
   }
 }
 
@@ -586,7 +607,7 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
       socket.on('error', reject)
       setTimeout(() => { socket.destroy(); reject(new Error('Timeout TCP ZPL')) }, 10000)
     })
-  } else {
+  } else if (canalDeZpl(process.platform, null) === 'winspool') {
     // Driver Windows: envio RAW pelo spooler (winspool).
     //
     // ══════════════════════════════════════════════════════════════════════
@@ -652,6 +673,17 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
       try { fs.unlinkSync(file) } catch (_) {}
       try { fs.unlinkSync(script) } catch (_) {}
     }
+  } else {
+    // Fila local no macOS: o mesmo RAW, pelo CUPS. Sem `-o raw` o driver
+    // desenha o ZPL como texto.
+    const fs = require('fs')
+    const file = path.join(os.tmpdir(), `mhub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.zpl`)
+    fs.writeFileSync(file, buffer)
+    try {
+      entregarAoCups(argumentosDeZplRaw({ impressora: printerName, arquivo: file }))
+    } finally {
+      try { fs.unlinkSync(file) } catch (_) {}
+    }
   }
 }
 
@@ -691,17 +723,20 @@ async function descobrirImpressoras () {
         type:         detectarTipoImpressora(p.Name),
       }))
     } else {
-      const { execSync } = require('child_process')
-      const raw = execSync('lpstat -a 2>/dev/null || echo ""', { timeout: 5000 }).toString()
-      return raw.split('\n')
-        .filter(l => l.trim())
-        .map(l => l.split(' ')[0])
-        .filter(Boolean)
-        .map(name => ({
-          system_name:  name,
-          display_name: name,
-          type:         detectarTipoImpressora(name),
-        }))
+      const { execFileSync } = require('child_process')
+      let raw = ''
+      try {
+        raw = execFileSync('lpstat', ['-a'], { timeout: 5000, encoding: 'utf8' })
+      } catch (e) {
+        // Sem nenhuma fila o lpstat sai com código 1 e a frase no stderr.
+        // stdout vazio é lista vazia — não é falha da descoberta.
+        raw = e.stdout ? String(e.stdout) : ''
+      }
+      return interpretarLpstat(raw).map(name => ({
+        system_name:  name,
+        display_name: name,
+        type:         detectarTipoImpressora(name),
+      }))
     }
   } catch (err) {
     console.error('[PRINTERS] Erro ao descobrir impressoras:', err.message)
@@ -916,8 +951,10 @@ async function verificarAtualizacao () {
         autoUpdater.checkForUpdatesAndNotify()
       } else {
         shell.openExternal(
-          latest.download_url ||
-          'https://github.com/leorobaskievicz/maximus-printer-client/releases/latest'
+          process.platform === 'darwin'
+            ? 'https://github.com/Maximus-Hub-BR/maximus-printer-client/releases/latest'
+            : (latest.download_url ||
+              'https://github.com/Maximus-Hub-BR/maximus-printer-client/releases/latest')
         )
       }
     } else {
