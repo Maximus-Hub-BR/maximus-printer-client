@@ -12,10 +12,13 @@
 # O job do Mac não publica sozinho: anexa `.dmg`, `.zip` e `latest-mac.yml` no
 # release que já existe. Os dois ao mesmo tempo disputam a criação do release.
 #
-# ⚠️ Não há certificado "Developer ID Application" nesta conta. Sem ele a Apple
-# não notariza, e o Gatekeeper pede confirmação na primeira abertura. Assinar
-# com "Apple Distribution" (que é de loja) faz o sistema dizer que o app está
-# danificado. `identity: null` no package.json pula a assinatura de propósito.
+# ⚠️ O Developer ID da VCZ existe no Mac do Leonardo (keychain), não no
+# runner. `identity: null` continua de propósito: o Actions não acha o
+# certificado e, se assinar com Apple Distribution, o Gatekeeper diz que o
+# app está danificado. O job do Mac sobe o DMG sem assinatura. Quem publica
+# a versão que abre em qualquer Mac substitui depois, com `gh release upload
+# --clobber`, o `.dmg`, o `.zip`, os blockmaps e o `latest-mac.yml` gerados
+# neste Mac com notarização.
 #
 # ⚠️ `GITHUB_TOKEN` é o do próprio Actions: o electron-builder cria o release
 # e sobe `.exe` + `latest.yml`, que é o arquivo que o `electron-updater`
