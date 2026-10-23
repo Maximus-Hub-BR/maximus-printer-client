@@ -1,6 +1,6 @@
 {
   "name": "maximushub-print-client",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "MaximusHub Print Client — impressão local via MQTT",
   "author": "MaximusHub",
   "main": "main.js",
@@ -41,8 +41,18 @@
       "icon": "assets/icon.icns",
       "category": "public.app-category.utilities",
       "target": [
-        { "target": "dmg", "arch": ["universal"] },
-        { "target": "zip", "arch": ["universal"] }
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
       ]
     },
     "nsis": {
