@@ -90,16 +90,16 @@ describe_bloco('ZPL ou EPL — o driver diz qual', () => {
     assert.strictEqual(linguagemDaImpressora('Microsoft Print to PDF'), null);
   });
 
-  teste('em EPL o comando é `JB`, não `~JSO`', () => {
+  teste('em EPL o comando é `JB`, não `~JSA`', () => {
     assert.strictEqual(comandosDePreparo({ linguagem: 'epl' }), 'JB\n');
-    assert.ok(!comandosDePreparo({ linguagem: 'epl' }).includes('~JSO'));
+    assert.ok(!comandosDePreparo({ linguagem: 'epl' }).includes('~JSA'));
   });
 
   teste('a impressora recebe o comando da SUA linguagem', async () => {
     const { preparo, enviados } = montar();
     await preparo.preparar('ZDesigner GC420t (EPL) (Copiar 1)');
     await preparo.preparar('ZDesigner GC420t (Copiar 1)');
-    assert.deepStrictEqual(enviados.map((e) => e.texto), ['JB\n', '~JSO\n']);
+    assert.deepStrictEqual(enviados.map((e) => e.texto), ['JB\n', '~JSA\n']);
   });
 
   /**
@@ -111,7 +111,7 @@ describe_bloco('ZPL ou EPL — o driver diz qual', () => {
   teste('a linguagem do JOB vence o nome do driver', async () => {
     const { preparo, enviados } = montar();
     await preparo.preparar('ZDesigner GC420t (EPL) (Copiar 1)', { linguagem: 'zpl' });
-    assert.deepStrictEqual(enviados.map((e) => e.texto), ['~JSO\n']);
+    assert.deepStrictEqual(enviados.map((e) => e.texto), ['~JSA\n']);
   });
 
   /**
@@ -123,7 +123,7 @@ describe_bloco('ZPL ou EPL — o driver diz qual', () => {
     const { preparo, enviados } = montar();
     assert.strictEqual(await preparo.preparar('Zebra ZD220', { linguagem: 'zpl' }), 'preparada');
     assert.strictEqual(await preparo.preparar('Zebra ZD220', { linguagem: 'epl' }), 'preparada');
-    assert.deepStrictEqual(enviados.map((e) => e.texto), ['~JSO\n', 'JB\n']);
+    assert.deepStrictEqual(enviados.map((e) => e.texto), ['~JSA\n', 'JB\n']);
     // mas não repete a mesma linguagem dentro do intervalo
     assert.strictEqual(await preparo.preparar('Zebra ZD220', { linguagem: 'zpl' }), 'recente');
   });
@@ -145,8 +145,21 @@ describe_bloco('ZPL ou EPL — o driver diz qual', () => {
 
 // ── o que é enviado ────────────────────────────────────────────────────────
 describe_bloco('os comandos', () => {
-  teste('o preparo mínimo é só `~JSO` — o que desliga o backfeed', () => {
-    assert.strictEqual(comandosDePreparo(), '~JSO\n');
+  /*
+   * 🚨 **INVERTIDO em 26/10/2026, e o motivo é uma etiqueta por impressão.**
+   *
+   * Era `~JSO` (*Backfeed Sequence: Off*), que desliga o recuo que a Zebra faz
+   * em Tear-Off antes de imprimir. Sem o recuo, a impressão seguinte começa
+   * uma etiqueta à frente e a que estava sob a cabeça sai BRANCA — foi o que
+   * o dono viu na ZD220: *"tá imprimindo duas páginas, e uma delas em
+   * branco"*. O job foi medido e estava correto (um ^XA, 100,1 × 150,0 mm):
+   * a folha extra era deste comando.
+   *
+   * `~JSA` mantém o backfeed (nenhuma etiqueta perdida) e o joga 100% para
+   * DEPOIS da impressão, no tempo morto em que o operador destaca o papel.
+   */
+  teste('o preparo mínimo é só `~JSA` — backfeed DEPOIS, nunca desligado', () => {
+    assert.strictEqual(comandosDePreparo(), '~JSA\n');
   });
 
   /**
@@ -163,7 +176,7 @@ describe_bloco('os comandos', () => {
 
   teste('a velocidade só entra quando pedida, e dentro de um formato', () => {
     assert.ok(!comandosDePreparo().includes('^PR'));
-    assert.strictEqual(comandosDePreparo({ velocidade: 4 }), '~JSO\n^XA^MMT^PR4^XZ\n');
+    assert.strictEqual(comandosDePreparo({ velocidade: 4 }), '~JSA\n^XA^MMT^PR4^XZ\n');
   });
 });
 
@@ -173,7 +186,7 @@ describe_bloco('a frequência', () => {
     const { preparo, enviados } = montar();
     assert.strictEqual(await preparo.preparar('Zebra ZD220'), 'preparada');
     assert.strictEqual(enviados.length, 1);
-    assert.strictEqual(enviados[0].texto, '~JSO\n');
+    assert.strictEqual(enviados[0].texto, '~JSA\n');
   });
 
   /** `~JS` é configuração persistente: repetir a cada lote só enche o spooler. */
@@ -301,3 +314,38 @@ function describe_bloco(nome, fn) {
   }
   console.log(`\n${passaram}/${casos.filter(([, f]) => f).length} casos`);
 })();
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🚨 A TRAVA: o backfeed nunca mais pode ser DESLIGADO (26/10/2026)
+ * ═══════════════════════════════════════════════════════════════════════════
+ * `~JSO` é a saída óbvia para "tirar a pausa entre etiquetas" — foi o que
+ * fizemos em 09/10 e custou uma etiqueta em branco por impressão na ZD220. O
+ * próximo que for atrás da mesma pausa vai encontrar o mesmo comando na
+ * documentação da Zebra; este caso é o que o para.
+ */
+describe_bloco('o backfeed não volta a ser desligado', () => {
+  teste('🚨 `~JSO` nunca é enviado, em nenhuma combinação', () => {
+    for (const opcoes of [
+      {},
+      { velocidade: 4 },
+      { linguagem: 'zpl' },
+      { linguagem: 'zpl', velocidade: 2 },
+      { linguagem: 'epl' },
+      { linguagem: 'epl', velocidade: 4 },
+    ]) {
+      assert.ok(
+        !comandosDePreparo(opcoes).includes('~JSO'),
+        `~JSO voltou em ${JSON.stringify(opcoes)} — isso custa uma etiqueta por impressão`,
+      );
+    }
+  });
+
+  /*
+   * ⚠️ E o comando continua existindo: tirar o `~JS` inteiro devolveria a
+   * pausa de 0,5–1,5 s por etiqueta que a expedição reclamou em 09/10.
+   */
+  teste('mas o backfeed continua sendo configurado — só que para DEPOIS', () => {
+    assert.ok(comandosDePreparo().startsWith('~JSA'));
+  });
+});
