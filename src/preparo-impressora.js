@@ -108,8 +108,38 @@ function linguagemDaImpressora(nomeDaImpressora) {
 /**
  * Os comandos, na ordem.
  *
- * **ZPL** — `~JSO` (*Backfeed Sequence: Off*). Control command: a impressora
- * processa na hora, sem imprimir nem avançar.
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 ERA `~JSO` E ISSO CUSTAVA UMA ETIQUETA EM BRANCO POR IMPRESSÃO
+ *    (26/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * Relato do dono, depois de testar na ZD220: *"a etiqueta do Meli na Zebra da
+ * MALU ainda tá imprimindo duas páginas, e uma delas em branco"*.
+ *
+ * O ZPL não tinha culpa — o job que saiu foi medido no banco (job 186148,
+ * 44.539 bytes): **um** `^XA`, `^LL1199` e `^PW799`, bitmap de 800 × 1199
+ * pontos = 100,1 × 150,0 mm. Uma etiqueta só, do tamanho exato do papel.
+ *
+ * A folha extra vinha DESTE comando. O mecanismo está escrito no cabeçalho
+ * deste arquivo desde o dia em que ele entrou: em Tear-Off a Zebra *"avança a
+ * etiqueta até a barra de destaque quando termina e **recua** antes da
+ * próxima"*. `~JSO` é **Backfeed Sequence: Off** — ele desliga justamente o
+ * recuo. Sem ele, a impressão seguinte começa onde o papel parou, uma
+ * etiqueta à frente, e a que estava sob a cabeça sai BRANCA.
+ *
+ * ⚠️ **`~JSA` resolve os dois lados.** O backfeed volta a existir (nenhuma
+ * etiqueta é perdida), mas 100% dele passa a acontecer **depois** de
+ * imprimir — no tempo morto em que o operador destaca o papel. A pausa que a
+ * expedição reclamava em 09/10 era o recuo *antes* da próxima; com `~JSA`
+ * ela sai do caminho crítico.
+ *
+ * ⚠️ **O EPL fica como está.** Lá o comando é `JB`, liga/desliga, sem o
+ * "quando" — e quem reclamou da pausa original foi justamente a GC420t em
+ * EPL. Trocar os dois de uma vez devolveria a pausa a quem o `JB` atende,
+ * para corrigir um sintoma que não é dela. Se a folha em branco aparecer numa
+ * EPL, o caminho é remover o `JB` daquela máquina pelo freio por impressora.
+ *
+ * **ZPL** — `~JSA` (*Backfeed Sequence: After*). Control command: a
+ * impressora processa na hora, sem imprimir nem avançar.
  *
  * **EPL** — `JB` (*Disable Top Of Form Backup*). Mesmo efeito, outra
  * linguagem. É o que a impressora da expedição entende, e o que faltava na
@@ -134,7 +164,7 @@ function comandosDePreparo({ velocidade = null, linguagem = 'zpl' } = {}) {
     if (velocidade) partes.push(`S${velocidade}`);
     return partes.join('\n') + '\n';
   }
-  const partes = ['~JSO'];
+  const partes = ['~JSA'];
   if (velocidade) partes.push(`^XA^MMT^PR${velocidade}^XZ`);
   return partes.join('\n') + '\n';
 }
@@ -171,7 +201,7 @@ function criarPreparoDeImpressora({
      * a MESMA impressora cujo driver é EPL — e a Zebra troca de linguagem
      * sozinha ao ver o `^XA` ("automatic printer language detection and
      * switching", manual da GC420t). Nesse caso ela está em ZPL e quem vale é
-     * o `~JSO`; o nome do driver passa a ser só o palpite de quando o job vem
+     * o `~JSA`; o nome do driver passa a ser só o palpite de quando o job vem
      * em PDF, que é o caminho que de fato passa pelo driver.
      */
     const linguagem = opcoes.linguagem || linguagemDaImpressora(nomeDaImpressora);
@@ -180,7 +210,7 @@ function criarPreparoDeImpressora({
     /*
      * ⚠️ A memória é por (impressora, LINGUAGEM). A mesma máquina recebendo um
      * lote em ZPL e outro em PDF precisa dos dois comandos: em modo ZPL o `JB`
-     * é ignorado, e em modo EPL o `~JSO` também. Com a chave só no nome, o
+     * é ignorado, e em modo EPL o `~JSA` também. Com a chave só no nome, o
      * segundo modo ficaria uma hora sem preparo nenhum.
      */
     const chave = `${nomeDaImpressora}\u0000${linguagem}`;
