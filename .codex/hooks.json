@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh '/usr/local/var/www/vhosts/maximushub.com.br/print-client/.codex/hooks/sincronizar-brain.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}
