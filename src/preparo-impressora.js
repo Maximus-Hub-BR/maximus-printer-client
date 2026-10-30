@@ -218,7 +218,25 @@ function criarPreparoDeImpressora({
     if (ultimo && agora() - ultimo < intervaloMs) return 'recente';
 
     try {
-      await enviarZpl(nomeDaImpressora, comandosDePreparo({ ...opcoes, linguagem }));
+      /*
+       * ⚠️ O DESTINO VAI JUNTO (30/10/2026). O preparo chamava o envio sem
+       * dizer para ONDE — e o envio, sem destino, cai no spooler do Windows.
+       * Numa Zebra configurada por IP (`zpl_host`) isso tem duas
+       * consequências, as duas observadas na VM de teste:
+       *
+       *  1. a impressora NUNCA recebe o `~JSA`/`JB`, que é o comando que tira
+       *     a pausa entre etiquetas — exatamente a queixa de lentidão que
+       *     originou esta investigação;
+       *  2. o comando vai para a fila do Windows de MESMO NOME, que pode nem
+       *     ser o mesmo equipamento. Configurar a impressora errada é pior do
+       *     que não configurar nenhuma.
+       *
+       * Quem manda o preparo tem de mandá-lo pelo mesmo caminho do job.
+       */
+      await enviarZpl(nomeDaImpressora, comandosDePreparo({ ...opcoes, linguagem }), {
+        zplHost: opcoes.zplHost || null,
+        zplPort: opcoes.zplPort || null,
+      });
       ultimoPreparo.set(chave, agora());
       registrar(
         `impressora ${nomeDaImpressora} preparada em ${linguagem.toUpperCase()} (backfeed desligado)`,

@@ -422,7 +422,10 @@ const {
  * etiqueta de sair.
  */
 const preparoDeImpressora = criarPreparoDeImpressora({
-  enviarZpl: (nome, texto) => imprimirZpl(Buffer.from(texto, 'ascii'), null, null, nome),
+  // ⚠️ O destino vem do PREPARO, que o recebe do job: comando de configuração
+  // tem de ir pelo mesmo caminho da etiqueta (ver `preparo-impressora.js`).
+  enviarZpl: (nome, texto, destino = {}) =>
+    imprimirZpl(Buffer.from(texto, 'ascii'), destino.zplHost || null, destino.zplPort || null, nome),
   /**
    * Desliga o suporte BIDIRECIONAL da fila do Windows — a correção que a
    * própria Zebra indica para "long delay between print jobs" em impressora
@@ -466,6 +469,21 @@ const preparoDeImpressora = criarPreparoDeImpressora({
 const filaDeImpressao = criarFilaDeImpressao({
   imprimir: async (lote) => {
     const { job } = lote[0]
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     * 🚨 O REGISTRO VEM ANTES DOS BYTES (30/10/2026)
+     * ══════════════════════════════════════════════════════════════════════
+     * Medido byte a byte no teste da queda: o job 223216 foi entregue no
+     * destino, o app foi fechado ANTES de o cliente anotar a entrega, e a
+     * recuperação imprimiu de novo — duas etiquetas iguais no balcão.
+     *
+     * A janela entre "os bytes saíram" e "anotei que saíram" não desaparece;
+     * a ordem só escolhe o lado do erro. Gravando `enviando` ANTES, o estado
+     * passa a existir mesmo que o processo morra no meio — e o servidor
+     * marca toda recuperação como REIMPRESSAO no papel, então o pior caso
+     * vira uma etiqueta identificada, não um sósia.
+     */
+    for (const item of lote) registroDeImpressao.marcarEnviando(item.job.job_uuid)
     const buffers = lote.map((i) => Buffer.from(i.job.data, 'base64'))
     // ⚠️ Antes do lote: desliga o backfeed na Zebra, que é o "recalibrar"
     // entre uma etiqueta e outra. Só vale para impressora que fala ZPL e por
@@ -476,7 +494,10 @@ const filaDeImpressao = criarFilaDeImpressao({
     // instalado no Windows seja o EPL.
     await preparoDeImpressora.preparar(job.printer_system_name, {
       ...obterPreparo(job.printer_system_name),
-      ...(job.type === 'zpl' ? { linguagem: 'zpl' } : {})
+      ...(job.type === 'zpl' ? { linguagem: 'zpl' } : {}),
+      // Mesmo destino do job: socket quando a Zebra tem IP, spooler quando não.
+      zplHost: job.zpl_host || null,
+      zplPort: job.zpl_port || null,
     })
     if (job.type === 'zpl') {
       // ⚠️ ZPL é um fluxo de comandos (`^XA`…`^XZ` por etiqueta): concatenar
@@ -513,7 +534,13 @@ const filaDeImpressao = criarFilaDeImpressao({
    */
   confirmar: (item, status, erro) => {
     registroDeImpressao.marcarImpresso(item.job.job_uuid, status, erro)
-    agendarGravacaoDoRegistro()
+    /*
+     * ⚠️ SÍNCRONO, não agendado. O debounce de 1 s não sobrevive a um
+     * fechamento que aconteça no intervalo — e foi exatamente nesse
+     * intervalo que a duplicata de 30/10/2026 nasceu. O custo é uma
+     * gravação de poucos KB por etiqueta; o da alternativa é papel duplo.
+     */
+    registroDeImpressao.salvar()
     if (!mqttClient || !mqttClient.connected) {
       // Fica pendente de propósito: o HTTP resolve.
       agendarAcksPendentes()
@@ -660,6 +687,14 @@ async function puxarPendentes () {
     let jaImpressos = 0
     for (const job of jobs) {
       if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
+        /*
+         * ⚠️ O Hub REOFERECER este job é a prova de que ele não tem o nosso
+         * ACK — ainda que o MQTT tenha dado PUBACK (que prova entrega ao
+         * BROKER, não registro no Hub). Sem desmarcar, o job voltava em todo
+         * pull para sempre: medido em 30/10/2026, dois ficaram nesse laço a
+         * cada 2 minutos, e na tela como "não confirmada" que nunca some.
+         */
+        registroDeImpressao.precisaReconfirmar(job.job_uuid)
         jaImpressos++
         continue
       }
@@ -701,6 +736,8 @@ function ligarRotinasDeContinuidade () {
  */
 function enfileirar (job, userId) {
   if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
+    // Mesma razão do pull: se chegou de novo, o Hub não tem o nosso ACK.
+    registroDeImpressao.precisaReconfirmar(job.job_uuid)
     registrar(`[fila] ${job.job_uuid} já foi impresso — reconfirmando, sem imprimir de novo`)
     agendarAcksPendentes()
     return
@@ -962,6 +999,7 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1
      * mesmo após o sucesso, e num lote isso deixava um timer vivo por
      * impressão, cada um com um `socket.destroy()` agendado.
      */
+    const comecouSocket = Date.now()
     await new Promise((resolve, reject) => {
       const net = require('net')
       let relogio = null
@@ -973,8 +1011,26 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1
         socket.write(buffer)
         socket.end()
       })
-      socket.on('close', () => encerrar(resolve))
-      socket.on('error', (erro) => encerrar(reject, erro))
+      socket.on('close', () => {
+        /*
+         * ⚠️ O socket NÃO registrava nada (30/10/2026): o winspool ganhou a
+         * linha de tempo e este ramo ficou mudo, então 174 envios seguidos
+         * não deixaram UMA linha no log. "Está lento" por aqui era
+         * inauditável.
+         */
+        registrar(
+          `[zpl] ${printerName} via ${zplHost}:${zplPort}: ${etiquetas} etiqueta(s), ` +
+            `${(buffer.length / 1024).toFixed(0)} KB em ${Date.now() - comecouSocket} ms`,
+        )
+        encerrar(resolve)
+      })
+      socket.on('error', (erro) => {
+        registrar(
+          `[zpl] ${printerName} via ${zplHost}:${zplPort}: FALHA após ` +
+            `${Date.now() - comecouSocket} ms — ${erro && erro.message}`,
+        )
+        encerrar(reject, erro)
+      })
       relogio = setTimeout(() => {
         socket.destroy()
         encerrar(reject, new Error(`Timeout TCP ZPL (${etiquetas} etiqueta(s), teto ${tetoDoEnvioRaw(etiquetas)} ms)`))
@@ -1090,7 +1146,8 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1
        */
       registrar(
         `[zpl] ${printerName}: ${etiquetas} etiqueta(s), ${(buffer.length / 1024).toFixed(0)} KB ` +
-          `entregues ao winspool em ${Date.now() - comecou} ms (teto ${tetoDoEnvioRaw(etiquetas)} ms)`,
+          `aceitos pelo winspool em ${Date.now() - comecou} ms (teto ${tetoDoEnvioRaw(etiquetas)} ms) ` +
+            `— ACEITO não é IMPRESSO: o spooler ainda pode recusar o job depois`,
       )
     } catch (e) {
       const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
@@ -1160,7 +1217,19 @@ async function registrarAgente (token) {
  * Quem chama decide: o sync não envia nada quando isto devolve `null`; a
  * tela mostra a lista que conseguir.
  */
+/**
+ * Quanto esperar pelo `Get-Printer`.
+ *
+ * ⚠️ 10 s era pouco: UMA fila problemática (rede fora do ar, driver de classe
+ * IPP apontando para destino que não responde) segura a enumeração inteira, e
+ * aí a descoberta falha e **todas** as impressoras do PC deixam de ser
+ * publicadas. O custo de esperar mais é adiar o sync; o de esperar menos é a
+ * Zebra sumir do Hub por causa de uma impressora que ninguém usa.
+ */
+const TETO_DA_DESCOBERTA_MS = 45000
+
 async function descobrirImpressoras () {
+  const comecouDescoberta = Date.now()
   try {
     if (process.platform === 'win32') {
       /*
@@ -1174,12 +1243,16 @@ async function descobrirImpressoras () {
         execFile(
           'powershell',
           ['-NoProfile', '-Command', 'Get-Printer | Select-Object Name | ConvertTo-Json'],
-          { timeout: 10000, windowsHide: true, maxBuffer: 1024 * 1024 },
+          { timeout: TETO_DA_DESCOBERTA_MS, windowsHide: true, maxBuffer: 1024 * 1024 },
           (erro, stdout) => (erro ? reject(erro) : resolve(String(stdout))),
         )
       })
       const parsed = JSON.parse(raw)
       const list = Array.isArray(parsed) ? parsed : [parsed]
+      // ⚠️ O número entra no log: "não puxou impressora" e "o PC não tem
+      // impressora" são coisas diferentes, e sem este registro elas chegam
+      // iguais em quem vai investigar.
+      registrar(`[impressoras] ${list.length} encontrada(s) em ${Date.now() - comecouDescoberta} ms`)
       return list.map(p => ({
         system_name:  p.Name,
         display_name: p.Name,
@@ -1202,8 +1275,19 @@ async function descobrirImpressoras () {
       }))
     }
   } catch (err) {
-    // ⚠️ `null`, nunca `[]` — ver o cabeçalho desta função.
-    console.error('[PRINTERS] Erro ao descobrir impressoras:', err.message)
+    /*
+     * ⚠️ `null`, nunca `[]` — ver o cabeçalho desta função.
+     *
+     * 🚨 E o motivo vai para o LOG, não só para o `console.error`
+     * (30/10/2026). O console de um app de bandeja não é lido por ninguém: na
+     * primeira vez que esta descoberta falhou em produção, "não puxou nenhuma
+     * impressora" não tinha NENHUM rastro na máquina, e a causa só apareceu
+     * cruzando duas colunas do banco do servidor. Todo `catch` de borda que
+     * devolve genérico tem de dizer o motivo onde alguém vai procurar.
+     */
+    const detalhe = err && err.killed ? `timeout de ${err.timeout || 'N'} ms` : (err && err.message) || String(err)
+    registrar(`[impressoras] FALHA ao descobrir: ${detalhe} — a lista NÃO será publicada (protege as já cadastradas)`)
+    console.error('[PRINTERS] Erro ao descobrir impressoras:', err && err.message)
     return null
   }
 }
@@ -1242,7 +1326,14 @@ async function sincronizarImpressoras (token, agentUuid, { forcar = false } = {}
   try {
     const printers = await descobrirImpressoras()
     if (!listaPodeSerPublicada(printers)) {
-      console.error('[SYNC] descoberta falhou — POST não enviado (lista vazia apagaria o agente)')
+      /*
+       * 🚨 Este caminho era INVISÍVEL (30/10/2026). "Instalei, loguei e não
+       * puxou nenhuma impressora" não deixava rastro algum na máquina:
+       * `console.error` num app de bandeja não é lido por ninguém, e a
+       * investigação teve de ser feita cruzando colunas do banco do SERVIDOR.
+       * Toda saída silenciosa daqui passa a dizer o que aconteceu.
+       */
+      registrar('[sync] descoberta falhou — POST NÃO enviado (lista vazia apagaria as impressoras do Hub)')
       return null
     }
     const res = await axios.post(
@@ -1251,9 +1342,14 @@ async function sincronizarImpressoras (token, agentUuid, { forcar = false } = {}
       { headers: { Authorization: `Bearer ${token}` } }
     )
     ultimoSyncEm = agora
+    registrar(`[sync] ${printers.length} impressora(s) publicada(s) no Hub`)
     return res.data
   } catch (err) {
-    console.error('[SYNC] Erro ao sincronizar impressoras:', err.message)
+    // ⚠️ O status HTTP entra no log: 401 (token), 404 (agente de outra conta)
+    // e erro de rede pedem ações diferentes, e sem ele os três chegam como
+    // "não puxou impressora".
+    const status = err.response ? `HTTP ${err.response.status}` : 'sem resposta'
+    registrar(`[sync] FALHA ao publicar (${status}): ${err.response?.data?.message || err.message}`)
     return null
   }
 }

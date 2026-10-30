@@ -137,6 +137,68 @@ teste('🚨 no main.js o require vem ANTES do uso (TDZ não aparece no --check)'
   assert.ok(doRequire < doUso, 'o require precisa vir ANTES da chamada');
 });
 
+teste('🚨 `enviando` é gravado NA HORA (sobrevive ao fechamento do app)', () => {
+  /*
+   * O caso de 30/10/2026: a etiqueta foi entregue no destino, o app fechou
+   * antes de o cliente registrar, e a recuperação imprimiu de novo. A
+   * gravação do `enviando` não pode depender de debounce.
+   */
+  let gravacoes = 0;
+  let disco = {};
+  const reg = criarRegistroDeImpressao({
+    ler: () => disco,
+    gravar: (d) => { disco = JSON.parse(JSON.stringify(d)); gravacoes++; },
+  });
+  reg.marcarEnviando('u-1');
+  assert.strictEqual(gravacoes, 1, 'o enviando não foi gravado imediatamente');
+  assert.ok(disco['u-1'], 'o enviando não chegou ao disco');
+  assert.strictEqual(disco['u-1'].estado, 'enviando');
+});
+
+teste('o estado avança de enviando para impresso', () => {
+  const { reg } = memoria();
+  reg.marcarEnviando('u-1');
+  assert.strictEqual(reg.estadoDe('u-1'), 'enviando');
+  reg.marcarImpresso('u-1', 'success', null);
+  assert.strictEqual(reg.estadoDe('u-1'), 'impresso');
+});
+
+teste('⚠️ job em `enviando` NÃO é confirmado ao Hub (não sabemos se saiu)', () => {
+  const { reg } = memoria();
+  reg.marcarEnviando('u-1');
+  assert.deepStrictEqual(reg.pendentesDeConfirmacao(), []);
+  reg.marcarImpresso('u-1', 'success', null);
+  assert.strictEqual(reg.pendentesDeConfirmacao().length, 1);
+});
+
+teste('🚨 reconfirmar DESMARCA o confirmado (o Hub provou que não recebeu)', () => {
+  /*
+   * Dois jobs ficaram voltando em TODO pull (23:03, 23:05, 23:07, 23:12…):
+   * o cliente os tinha como confirmados porque o MQTT deu PUBACK — que prova
+   * que o BROKER recebeu, não que o Hub registrou.
+   */
+  const { reg } = memoria();
+  reg.marcarImpresso('u-1', 'success', null);
+  reg.marcarConfirmado('u-1');
+  assert.strictEqual(reg.pendentesDeConfirmacao().length, 0, 'devia estar confirmado');
+
+  assert.strictEqual(reg.precisaReconfirmar('u-1'), true);
+  assert.strictEqual(reg.pendentesDeConfirmacao().length, 1, 'não voltou para a fila de ACK');
+});
+
+teste('reconfirmar job desconhecido devolve false, sem criar entrada', () => {
+  const { reg } = memoria();
+  assert.strictEqual(reg.precisaReconfirmar('u-nunca-visto'), false);
+  assert.strictEqual(reg.jaImprimiu('u-nunca-visto'), false);
+});
+
+teste('marcarEnviando não sobrescreve um job que JÁ saiu', () => {
+  const { reg } = memoria();
+  reg.marcarImpresso('u-1', 'success', null);
+  reg.marcarEnviando('u-1');
+  assert.strictEqual(reg.estadoDe('u-1'), 'impresso');
+});
+
 for (const [nome, fn] of casos) {
   try { fn(); passaram++; console.log(`  ✓ ${nome}`); }
   catch (erro) { console.error(`  ✗ ${nome}\n    ${erro.message}`); process.exitCode = 1; }

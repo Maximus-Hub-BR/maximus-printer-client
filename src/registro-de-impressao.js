@@ -105,19 +105,74 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
     jaImprimiu: (jobUuid) => Boolean(jobUuid && dados[jobUuid]),
 
     /**
+     * O que sabemos deste job: `'enviando'`, `'impresso'` ou `null`.
+     *
+     * ⚠️ `'enviando'` existe por causa da duplicata medida em 30/10/2026: o
+     * cliente entregou a etiqueta no destino, o app foi fechado ANTES de
+     * registrar a entrega, e a recuperação imprimiu de novo. A janela entre
+     * "os bytes saíram" e "anotei que saíram" é real, e nenhuma ordem de
+     * gravação a elimina — ela só escolhe o lado do erro:
+     *
+     *   gravar DEPOIS  → risco de DUPLICAR (o que acontecia)
+     *   gravar ANTES   → risco de PERDER (pior para etiqueta)
+     *
+     * Gravando os dois momentos, o estado `'enviando'` sem `'impresso'` vira
+     * informação: "pode ter saído". Quem decide o que fazer com isso é o
+     * chamador — e hoje a decisão é imprimir de novo, porque o servidor
+     * marca a recuperação como REIMPRESSAO no papel.
+     */
+    estadoDe: (jobUuid) => (jobUuid && dados[jobUuid] ? dados[jobUuid].estado || 'impresso' : null),
+
+    /**
+     * Registra que o job está SAINDO agora — antes de qualquer byte.
+     *
+     * ⚠️ Grava em disco na hora (sem debounce): o ponto inteiro é sobreviver
+     * a um fechamento que aconteça nos próximos milissegundos.
+     */
+    marcarEnviando(jobUuid) {
+      if (!jobUuid || dados[jobUuid]) return;
+      dados[jobUuid] = { em: agora(), estado: 'enviando', status: null, erro: null, confirmado: false };
+      salvar();
+    },
+
+    /**
+     * O Hub reofereceu um job que já imprimimos — então ele NÃO recebeu o
+     * nosso ACK, por mais que o MQTT tenha confirmado a entrega ao broker.
+     *
+     * ⚠️ Sem isto o job volta em TODO pull, para sempre: medido em
+     * 30/10/2026, dois jobs ficaram nesse laço (23:03, 23:05, 23:07, 23:08,
+     * 23:12…). O cliente os tinha como confirmados e nunca os reenviava; o
+     * Hub nunca soube. Na tela, "enviada e não confirmada" que não some.
+     */
+    precisaReconfirmar(jobUuid) {
+      if (!jobUuid || !dados[jobUuid]) return false;
+      if (!dados[jobUuid].confirmado) return true;
+      dados[jobUuid].confirmado = false;
+      return true;
+    },
+
+    /**
      * Registra que o job foi entregue à impressora. Idempotente: não
      * sobrescreve o instante original, que é o que a poda usa.
      */
     marcarImpresso(jobUuid, status, erro) {
       if (!jobUuid) return;
-      if (!dados[jobUuid]) {
-        dados[jobUuid] = {
-          em: agora(),
-          status: status === 'error' ? 'error' : 'success',
-          erro: erro || null,
-          confirmado: false,
-        };
-      }
+      const anterior = dados[jobUuid];
+      /*
+       * ⚠️ O PRIMEIRO desfecho é o que vale: um job já `'impresso'` não é
+       * reescrito por uma segunda chamada (foi assim desde sempre, e o caso
+       * que trava isso está no teste). O que mudou é que o estado
+       * `'enviando'` AVANÇA — senão o `marcarEnviando` deixaria todo job
+       * preso no intermediário e `pendentesDeConfirmacao` nunca o veria.
+       */
+      if (anterior && anterior.estado !== 'enviando') return;
+      dados[jobUuid] = {
+        em: anterior ? anterior.em : agora(),
+        estado: 'impresso',
+        status: status === 'error' ? 'error' : 'success',
+        erro: erro || null,
+        confirmado: anterior ? Boolean(anterior.confirmado) : false,
+      };
     },
 
     /** O Hub aceitou o ACK deste job. */
@@ -128,7 +183,9 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
     /** Os ACKs que o Hub ainda não aceitou — o que vai por HTTP. */
     pendentesDeConfirmacao() {
       return Object.entries(dados)
-        .filter(([, item]) => !item.confirmado)
+        // ⚠️ `'enviando'` ainda não tem desfecho: confirmar agora diria ao
+        // Hub que saiu uma etiqueta que talvez não tenha saído.
+        .filter(([, item]) => !item.confirmado && item.estado !== 'enviando')
         .sort((a, b) => a[1].em - b[1].em)
         .map(([job_uuid, item]) => ({ job_uuid, status: item.status, error: item.erro }));
     },
