@@ -248,6 +248,20 @@ function conectarMqtt (token) {
     mqttClient.subscribe(`hub/print/${userId}/${agentUuid}`, { qos: 1 })
     notificar('MaximusHub', 'Print Client conectado e pronto.')
     await sincronizarImpressoras(token, agentUuid)
+    /*
+     * ⚠️ CONTINUIDADE: ao voltar, a primeira coisa é perguntar o que ficou
+     * sem confirmação e reconfirmar o que já saiu no papel. Era exatamente
+     * aqui que a etiqueta se perdia — o que o Hub publicou enquanto este
+     * cliente estava fora não existe em lugar nenhum, e só o pull o traz de
+     * volta. Ver `puxarPendentes`.
+     *
+     * ⚠️ Os ACKs vão PRIMEIRO: se o Hub ainda não sabe o que já imprimimos,
+     * ele oferece esses jobs de novo e o pull teria de descartá-los um por
+     * um. Confirmar antes encurta a lista na origem.
+     */
+    await enviarAcksPendentes()
+    await puxarPendentes()
+    ligarRotinasDeContinuidade()
   })
 
   mqttClient.on('message', (topic, payload) => {
@@ -332,6 +346,11 @@ function caminhoDoLog () {
   return path.join(app.getPath('userData'), 'print.log')
 }
 
+/** O registro do que já foi impresso (ver `src/registro-de-impressao.js`). */
+function caminhoDoRegistro () {
+  return path.join(app.getPath('userData'), 'impressos.json')
+}
+
 function registrar (mensagem) {
   const linha = `${new Date().toISOString()} ${mensagem}`
   console.log(linha)
@@ -347,8 +366,43 @@ function registrar (mensagem) {
   } catch (_) { /* log nunca pode derrubar impressão */ }
 }
 
+// ⚠️ O require vem ANTES do uso: `const` tem TDZ, e chamar
+// `criarRegistroDeImpressao` acima desta linha é ReferenceError em runtime —
+// que o `node --check` NÃO acusa, porque ele só vê sintaxe. O caso que trava
+// isso está em `src/registro-de-impressao.test.js`.
+const { criarRegistroDeImpressao } = require('./src/registro-de-impressao')
+
+/**
+ * O REGISTRO do que já saiu no papel — `src/registro-de-impressao.js`.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 ELE É O QUE TORNA O PULL SEGURO (30/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * O Hub passou a OFERECER os jobs que publicou e não teve ACK, e o cliente
+ * passou a puxá-los ao conectar. Sem memória em disco isso reimprimiria o
+ * que já saiu — o job volta na lista justamente porque o ACK se perdeu, e o
+ * ACK se perde DEPOIS de a etiqueta sair da impressora.
+ *
+ * ⚠️ Gravação ATÔMICA (arquivo temporário + rename): o processo pode ser
+ * fechado no meio de um lote, e um JSON truncado seria lido como "nunca
+ * imprimi nada" — o pior estado possível aqui.
+ */
+const registroDeImpressao = criarRegistroDeImpressao({
+  ler: () => {
+    const fs = require('fs')
+    return JSON.parse(fs.readFileSync(caminhoDoRegistro(), 'utf8'))
+  },
+  gravar: (dados) => {
+    const fs = require('fs')
+    const destino = caminhoDoRegistro()
+    const temporario = `${destino}.tmp`
+    fs.writeFileSync(temporario, JSON.stringify(dados))
+    fs.renameSync(temporario, destino)
+  },
+})
+
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
-const { scriptPowerShell, comandoPowerShell } = require('./src/envio-raw-windows')
+const { scriptPowerShell, comandoPowerShell, argumentosPowerShell, tetoDoEnvioRaw } = require('./src/envio-raw-windows')
 const { criarPreparoDeImpressora, comandoDesligarBidi } = require('./src/preparo-impressora')
 const {
   canalDePdf,
@@ -375,11 +429,30 @@ const preparoDeImpressora = criarPreparoDeImpressora({
    * aplicar daqui sem ninguém abrir tela.
    */
   desligarBidi: async (nome) => {
-    const { execSync } = require('child_process')
+    /*
+     * ⚠️ ASSÍNCRONO pelo mesmo motivo do envio RAW (ver `imprimirZpl`): isto
+     * roda ANTES DE CADA LOTE, no caminho crítico. Com `execSync` eram até
+     * 15 s de event loop parado por lote, somados aos do envio — e é assim
+     * que o keepalive de 30 s do MQTT estoura e o broker derruba o cliente,
+     * levando com ele as etiquetas publicadas no intervalo.
+     */
+    const { execFile } = require('child_process')
     if (process.platform !== 'win32') return 'ignorado_fora_do_windows'
-    const ps = comandoDesligarBidi(nome).replace(/"/g, '\\"')
-    const saida = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`,
-      { timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] })
+    const ps = comandoDesligarBidi(nome)
+    const saida = await new Promise((resolve, reject) => {
+      execFile(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
+        { timeout: 15000, windowsHide: true },
+        (erro, stdout, stderr) => {
+          if (erro) {
+            if (stderr) erro.stderr = stderr
+            return reject(erro)
+          }
+          resolve(stdout)
+        },
+      )
+    })
     return String(saida).trim() || 'sem_retorno'
   },
   registrar: (m) => registrar(`[preparo] ${m}`),
@@ -407,23 +480,230 @@ const filaDeImpressao = criarFilaDeImpressao({
     if (job.type === 'zpl') {
       // ⚠️ ZPL é um fluxo de comandos (`^XA`…`^XZ` por etiqueta): concatenar
       // é o formato nativo de mandar várias. Um socket, não N.
-      await imprimirZpl(Buffer.concat(buffers), job.zpl_host, job.zpl_port || 9100, job.printer_system_name)
+      await imprimirZpl(Buffer.concat(buffers), job.zpl_host, job.zpl_port || 9100, job.printer_system_name, buffers.length)
     } else {
       await imprimirPdf(buffers, job.printer_system_name, job.escala)
     }
   },
+  /**
+   * O ACK — e ele passou a ter GARANTIA (30/10/2026).
+   *
+   * ══════════════════════════════════════════════════════════════════════
+   * 🚨 O ACK SE PERDIA EXATAMENTE QUANDO IMPORTAVA
+   * ══════════════════════════════════════════════════════════════════════
+   * Publicar no MQTT era a única notícia que o Hub recebia — e o cliente
+   * publica na conexão que acabou de cair. Com `clean: true`, a confirmação
+   * evapora junto: a etiqueta saiu no papel e o Hub segue achando que não,
+   * o que faz o operador reimprimir e a tela mentir. Em 7 dias foram 1.298
+   * jobs nesse estado (os números estão em `registro-de-impressao.js`).
+   *
+   * Agora são três passos, nesta ordem:
+   *  1. **gravar no registro local** que a etiqueta saiu — ANTES de
+   *     qualquer rede. É o que impede o pull de reimprimir;
+   *  2. publicar no MQTT **com callback de QoS 1**: o callback só é chamado
+   *     quando o PUBACK chega, ou seja, quando o broker confirmou que
+   *     recebeu. Sem PUBACK, o ACK continua pendente no registro;
+   *  3. o que ficar pendente vai por **HTTP** na varredura (ver
+   *     `enviarAcksPendentes`), que é o caminho que não depende da sessão
+   *     que caiu.
+   *
+   * ⚠️ `mqttClient` ausente NÃO é mais um `return` cego: antes, imprimir
+   * offline significava papel na mão e nenhum registro em lugar nenhum.
+   */
   confirmar: (item, status, erro) => {
-    if (!mqttClient) return
+    registroDeImpressao.marcarImpresso(item.job.job_uuid, status, erro)
+    agendarGravacaoDoRegistro()
+    if (!mqttClient || !mqttClient.connected) {
+      // Fica pendente de propósito: o HTTP resolve.
+      agendarAcksPendentes()
+      return
+    }
     mqttClient.publish(
       `hub/ack/${item.userId}/${item.job.job_uuid}`,
       JSON.stringify({ job_uuid: item.job.job_uuid, status, error: erro }),
-      { qos: 1 }
+      { qos: 1 },
+      (erroDoPublish) => {
+        if (erroDoPublish) {
+          agendarAcksPendentes()
+          return
+        }
+        // PUBACK recebido: o broker tem o ACK.
+        registroDeImpressao.marcarConfirmado(item.job.job_uuid)
+        agendarGravacaoDoRegistro()
+      },
     )
   },
   registrar: (m) => registrar(`[fila] ${m}`),
 })
 
+// ─── Continuidade: o cliente PUXA o que falta e GARANTE o ACK ───────────────
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 POR QUE O CLIENTE PASSOU A PUXAR (30/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * O desenho era PUSH e volátil: o Hub publicava no tópico e, se o agente não
+ * estivesse no ar naquele segundo, a etiqueta morria (`clean: true` + Redis
+ * pub/sub sem durabilidade). Em 7 dias, 1.298 jobs publicados no vácuo — 73%
+ * de tudo que a RDF mandou em ZPL.
+ *
+ * A reentrega por reconexão, feita no servidor, foi o primeiro remendo e não
+ * fecha: depende de um EVENTO acontecer, tem carência de 3 min, janela e
+ * teto. No lote das 16:35 do dia 30/10 o agente perdeu 120 etiquetas e não
+ * reconectou depois — nada as recuperou.
+ *
+ * Quem sabe o que falta é o CLIENTE: ele tem o registro em disco do que saiu
+ * no papel. Então ele pergunta — ao conectar e a cada 2 minutos — e o
+ * `enfileirar` descarta o que já imprimiu, reconfirmando em vez de gastar
+ * papel. "Continuar de onde parou" deixa de ser recuperação de incidente e
+ * passa a ser o comportamento normal.
+ */
+
+/** De quanto em quanto tempo perguntar ao Hub o que falta imprimir. */
+const INTERVALO_DE_PULL_MS = 2 * 60 * 1000
+/** De quanto em quanto tempo reenviar por HTTP o ACK que o MQTT não levou. */
+const INTERVALO_DE_ACKS_MS = 30 * 1000
+
+let temporizadorDeGravacao = null
+let temporizadorDeAcks = null
+let pullEmCurso = false
+
+/**
+ * Grava o registro em disco UMA vez por rajada.
+ *
+ * ⚠️ Debounce de propósito: gravar por etiqueta seria uma ida ao disco por
+ * etiqueta num lote de 25. O atraso é aceitável porque o registro só precisa
+ * sobreviver ao PRÓXIMO reinício, e o `salvar` também é chamado ao fechar.
+ */
+function agendarGravacaoDoRegistro () {
+  if (temporizadorDeGravacao) return
+  temporizadorDeGravacao = setTimeout(() => {
+    temporizadorDeGravacao = null
+    registroDeImpressao.salvar()
+  }, 1000)
+  if (temporizadorDeGravacao.unref) temporizadorDeGravacao.unref()
+}
+
+/** Dispara o envio dos ACKs pendentes, agrupando a rajada do lote. */
+function agendarAcksPendentes () {
+  if (temporizadorDeAcks) return
+  temporizadorDeAcks = setTimeout(() => {
+    temporizadorDeAcks = null
+    void enviarAcksPendentes()
+  }, 3000)
+  if (temporizadorDeAcks.unref) temporizadorDeAcks.unref()
+}
+
+/**
+ * Manda por HTTP o que o MQTT não conseguiu confirmar.
+ *
+ * ⚠️ NUNCA lança: é chamada de temporizador e de callback de rede.
+ * ⚠️ Idempotente do outro lado (confirmar duas vezes escreve o mesmo
+ * resultado), então reenviar é seguro — é o que permite insistir.
+ */
+async function enviarAcksPendentes () {
+  const pendentes = registroDeImpressao.pendentesDeConfirmacao()
+  if (!pendentes.length) return
+  const token = store.get('token')
+  if (!token) return
+  const agentUuid = garantirAgentUuid()
+
+  // Teto por requisição: um agente que ficou horas fora não manda 5 mil de
+  // uma vez (o corpo iria a megabytes e o proxy do cliente pode recusar).
+  const lote = pendentes.slice(0, 200)
+  try {
+    await axios.post(
+      `${HUB_API}/print-agents/${agentUuid}/acks`,
+      { acks: lote },
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 },
+    )
+    for (const ack of lote) registroDeImpressao.marcarConfirmado(ack.job_uuid)
+    registroDeImpressao.salvar()
+    registrar(`[ack] ${lote.length} confirmação(ões) enviada(s) por HTTP`)
+    // Sobrou? Continua na próxima volta do temporizador.
+  } catch (erro) {
+    const detalhe = erro && erro.response ? `HTTP ${erro.response.status}` : (erro && erro.message) || erro
+    /*
+     * ⚠️ 404 significa "este agente não é desta conta" — insistir não
+     * resolve, mas também não se apaga o registro: ele é a prova de que o
+     * papel saiu. Fica para a próxima sessão.
+     */
+    registrar(`[ack] falha ao confirmar por HTTP (${detalhe}) — ${lote.length} pendente(s)`)
+  }
+}
+
+/**
+ * Pergunta ao Hub o que ficou sem confirmação e enfileira o que falta.
+ *
+ * ⚠️ `pullEmCurso` evita duas varreduras ao mesmo tempo (o `connect` e o
+ * temporizador podem coincidir): duas listas iguais em voo enfileirariam o
+ * mesmo job duas vezes antes de qualquer impressão — o registro só barra
+ * depois que a etiqueta saiu.
+ * ⚠️ NUNCA lança.
+ */
+async function puxarPendentes () {
+  if (pullEmCurso) return
+  const token = store.get('token')
+  const userId = store.get('user_id')
+  if (!token || !userId) return
+  const agentUuid = garantirAgentUuid()
+
+  pullEmCurso = true
+  try {
+    const resposta = await axios.get(
+      `${HUB_API}/print-agents/${agentUuid}/jobs/pendentes`,
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 },
+    )
+    const jobs = (resposta.data && resposta.data.data) || []
+    if (!jobs.length) return
+    let enfileirados = 0
+    let jaImpressos = 0
+    for (const job of jobs) {
+      if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
+        jaImpressos++
+        continue
+      }
+      enfileirar(job, userId)
+      enfileirados++
+    }
+    if (jaImpressos) agendarAcksPendentes()
+    registrar(
+      `[pull] ${jobs.length} pendente(s) no Hub: ${enfileirados} para imprimir, ` +
+        `${jaImpressos} já impresso(s) (reconfirmando)`,
+    )
+  } catch (erro) {
+    const detalhe = erro && erro.response ? `HTTP ${erro.response.status}` : (erro && erro.message) || erro
+    registrar(`[pull] falha ao consultar pendentes (${detalhe})`)
+  } finally {
+    pullEmCurso = false
+  }
+}
+
+/** Liga as duas rotinas. Idempotente: chamar de novo não duplica timer. */
+let rotinasLigadas = false
+function ligarRotinasDeContinuidade () {
+  if (rotinasLigadas) return
+  rotinasLigadas = true
+  const doPull = setInterval(() => void puxarPendentes(), INTERVALO_DE_PULL_MS)
+  const dosAcks = setInterval(() => void enviarAcksPendentes(), INTERVALO_DE_ACKS_MS)
+  if (doPull.unref) doPull.unref()
+  if (dosAcks.unref) dosAcks.unref()
+}
+
+/**
+ * Enfileira um job — com a trava que impede imprimir duas vezes.
+ *
+ * 🚨 O job pode chegar DUAS vezes: pelo MQTT e pelo pull de pendentes (ou
+ * duas vezes pelo pull, se o ACK não tiver sido aceito ainda). Imprimir de
+ * novo é colar etiqueta errada no pacote — então, se este `job_uuid` já saiu
+ * no papel, o cliente **reconfirma** em vez de imprimir. É esse caminho que
+ * conserta o estado do Hub sem gastar papel.
+ */
 function enfileirar (job, userId) {
+  if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
+    registrar(`[fila] ${job.job_uuid} já foi impresso — reconfirmando, sem imprimir de novo`)
+    agendarAcksPendentes()
+    return
+  }
   return filaDeImpressao.enfileirar(job, userId)
 }
 
@@ -660,7 +940,7 @@ async function gerarPdfTeste () {
   return Buffer.from(await doc.save())
 }
 
-async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
+async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1) {
   if (zplHost) {
     // Impressora de rede: TCP direto na porta 9100
     await new Promise((resolve, reject) => {
@@ -717,7 +997,30 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
     // padrão do driver, que para o ZDesigner pode ser o formato gráfico — e
     // aí os bytes do comando seriam IMPRESSOS como texto numa etiqueta, em
     // vez de interpretados.
-    const { execSync } = require('child_process')
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     * 🚨 ASSÍNCRONO, E ISSO NÃO É DETALHE DE ESTILO (30/10/2026)
+     * ══════════════════════════════════════════════════════════════════════
+     * Até a 1.0.17 aqui havia `execSync`, que **para o event loop do Node**
+     * até o PowerShell terminar. Enquanto o lote saía na Zebra, este
+     * processo não respondia ao keepalive de 30 s do MQTT: o broker
+     * derrubava a conexão e, com `clean: true`, TUDO o que o Hub publicava
+     * no intervalo evaporava — etiqueta que fica `sent` para sempre e só é
+     * descoberta contando o papel.
+     *
+     * Medido na RDF, no mesmo dia, em DUAS máquinas e DUAS versões:
+     * 87 etiquetas e queda no segundo do 81º job (agente 35, 1.0.14);
+     * 79 e queda com 173 publicadas no vácuo (agente 39, 1.0.17). O mesmo
+     * cliente ficou 5 h 13 min no ar imprimindo 645 etiquetas em PDF — e o
+     * PDF sempre usou `await`. As três quedas do dia foram em lote ZPL.
+     *
+     * ⚠️ `execFile` com LISTA de argumentos, não string: sem shell, nome de
+     * impressora com aspas ou `&` deixa de ser problema de escape.
+     * ⚠️ O timeout continua: PowerShell pendurado tem de virar erro, e a
+     * fila refaz a etiqueta uma a uma. O que mudou é que esperar não
+     * bloqueia mais a conexão.
+     */
+    const { execFile } = require('child_process')
     const fs   = require('fs')
     const base = path.join(os.tmpdir(), `mhub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`)
     const file = `${base}.bin`
@@ -728,12 +1031,51 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
     try {
       // ⚠️ `stdio: pipe` para a mensagem de erro do PowerShell chegar aqui: a
       // versão anterior engolia qualquer falha junto com o `Out-Null`.
-      execSync(comandoPowerShell(script, printerName, file), {
-        timeout: 15000,
-        stdio: ['ignore', 'pipe', 'pipe'],
+      const comecou = Date.now()
+      await new Promise((resolve, reject) => {
+        execFile(
+          'powershell',
+          argumentosPowerShell(script, printerName, file),
+          /*
+           * ⚠️ Teto de 60 s, não 15: o lote de 25 etiquetas gráficas é o
+           * caso NORMAL e a Zebra de entrada leva mais de 15 s para
+           * engoli-lo. Com `execSync` esse teto não podia crescer — cada
+           * segundo a mais era um segundo de conexão derrubada; agora
+           * esperar é de graça, e matar o PowerShell no meio de um lote que
+           * ia dar certo custa 25 reimpressões.
+           */
+          { timeout: tetoDoEnvioRaw(etiquetas), windowsHide: true, maxBuffer: 1024 * 1024 },
+          (erro, _saida, erroPadrao) => {
+            if (!erro) return resolve()
+            if (erroPadrao) erro.stderr = erroPadrao
+            reject(erro)
+          },
+        )
       })
+      /*
+       * ⚠️ ESTE NÚMERO É O QUE FALTAVA EM 30/10/2026. O PDF já registrava o
+       * tempo de entrega ao spooler; o ZPL não registrava nada, e por isso
+       * os 205 s por lote da RDF tiveram de ser reconstruídos pelo intervalo
+       * entre o `sent` e o ACK no banco do servidor — que mede outra coisa
+       * (inclui fila e desconexão). Com a linha abaixo, "está lento" passa a
+       * ter resposta no log da própria máquina: quanto o winspool levou,
+       * quantas etiquetas e qual era o teto.
+       */
+      registrar(
+        `[zpl] ${printerName}: ${etiquetas} etiqueta(s), ${(buffer.length / 1024).toFixed(0)} KB ` +
+          `entregues ao winspool em ${Date.now() - comecou} ms (teto ${tetoDoEnvioRaw(etiquetas)} ms)`,
+      )
     } catch (e) {
       const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
+      /*
+       * ⚠️ O tempo entra na mensagem de erro de propósito: é ele que separa
+       * "o PowerShell falhou" de "o teto estourou" — e foi a confusão entre
+       * os dois que escondeu o fallback um-a-um por semanas.
+       */
+      registrar(
+        `[zpl] ${printerName}: FALHOU após ${Date.now() - comecou} ms ` +
+          `(${etiquetas} etiqueta(s), teto ${tetoDoEnvioRaw(etiquetas)} ms) — ${detalhe.slice(0, 200)}`,
+      )
       throw new Error(`Envio RAW para "${printerName}" falhou: ${detalhe.slice(0, 300)}`)
     } finally {
       try { fs.unlinkSync(file) } catch (_) {}
@@ -794,8 +1136,21 @@ async function registrarAgente (token) {
 async function descobrirImpressoras () {
   try {
     if (process.platform === 'win32') {
-      const { execSync } = require('child_process')
-      const raw = execSync('powershell -NoProfile -Command "Get-Printer | Select-Object Name | ConvertTo-Json"', { timeout: 10000 }).toString()
+      /*
+       * ⚠️ Assíncrono: a descoberta roda em laço (a cada sync) e o
+       * `Get-Printer` pendura quando há fila de rede fora do ar. Com
+       * `execSync` esse tempo saía do event loop — o mesmo mecanismo que
+       * derrubava a conexão MQTT durante a impressão (ver `imprimirZpl`).
+       */
+      const { execFile } = require('child_process')
+      const raw = await new Promise((resolve, reject) => {
+        execFile(
+          'powershell',
+          ['-NoProfile', '-Command', 'Get-Printer | Select-Object Name | ConvertTo-Json'],
+          { timeout: 10000, windowsHide: true, maxBuffer: 1024 * 1024 },
+          (erro, stdout) => (erro ? reject(erro) : resolve(String(stdout))),
+        )
+      })
       const parsed = JSON.parse(raw)
       const list = Array.isArray(parsed) ? parsed : [parsed]
       return list.map(p => ({
@@ -991,6 +1346,9 @@ ipcMain.handle('print-test-label', async (_, { printer }) => {
 
 ipcMain.handle('logout', () => {
   store.clear()
+  // ⚠️ O registro é a prova de que o papel saiu: gravar ANTES de fechar, e
+  // de forma síncrona (o `salvar` é síncrono de propósito).
+  try { registroDeImpressao.salvar() } catch (_) {}
   if (mqttClient) { mqttClient.end(true); mqttClient = null }
   atualizarTray('desconectado')
   abrirLogin()
