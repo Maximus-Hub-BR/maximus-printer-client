@@ -8,7 +8,7 @@
  * que é exatamente onde os três defeitos moravam.
  */
 const assert = require('assert');
-const { scriptPowerShell, comandoPowerShell } = require('./envio-raw-windows');
+const { scriptPowerShell, comandoPowerShell, argumentosPowerShell, tetoDoEnvioRaw } = require('./envio-raw-windows');
 
 let passaram = 0;
 const casos = [];
@@ -129,6 +129,85 @@ teste('não executa o profile do usuário nem esbarra na política de execução
   assert.ok(cmd.includes('-ExecutionPolicy Bypass'));
 });
 
+// ── 30/10/2026: a forma em LISTA, que tirou o shell do caminho ───────────
+/**
+ * ⚠️ Estes casos existem porque o envio RAW passou de `execSync` (string de
+ * comando, event loop parado) para `execFile` (lista, assíncrono). O defeito
+ * que isso corrige está no cabeçalho de `argumentosPowerShell`: enquanto o
+ * PowerShell rodava, o cliente não respondia ao keepalive do MQTT e o broker
+ * o derrubava — levando as etiquetas publicadas no intervalo.
+ */
+teste('argumentosPowerShell: usa -File e põe script, impressora e arquivo em ORDEM', () => {
+  const args = argumentosPowerShell('C:\\tmp\\a.ps1', 'ZDesigner ZD220-203dpi ZPL', 'C:\\tmp\\a.bin');
+  assert.ok(args.includes('-File'));
+  assert.ok(!args.includes('-Command'));
+  const i = args.indexOf('-File');
+  assert.strictEqual(args[i + 1], 'C:\\tmp\\a.ps1');
+  assert.strictEqual(args[i + 2], 'ZDesigner ZD220-203dpi ZPL');
+  assert.strictEqual(args[i + 3], 'C:\\tmp\\a.bin');
+});
+
+teste('⚠️ nenhum argumento carrega aspas — é a lista que dispensa escape', () => {
+  const args = argumentosPowerShell('s.ps1', 'IMP', 'a.bin');
+  for (const a of args) assert.ok(!a.includes('"'), `argumento com aspas: ${a}`);
+});
+
+teste('nome com aspas e & chega INTEIRO, em um argumento só', () => {
+  const nome = 'Zebra "do balcao" & cia';
+  const args = argumentosPowerShell('s.ps1', nome, 'a.bin');
+  assert.strictEqual(args.filter((a) => a === nome).length, 1);
+});
+
+teste('🚨 script e dados NUNCA na mesma string (a classe do 1.0.7)', () => {
+  const args = argumentosPowerShell('s.ps1', 'IMP', 'a.bin');
+  assert.strictEqual(args.filter((a) => a.includes('IMP') && a.includes('a.bin')).length, 0);
+});
+
+teste('a lista também não executa profile nem política', () => {
+  const args = argumentosPowerShell('s.ps1', 'X', 'a.bin');
+  assert.ok(args.includes('-NoProfile'));
+  assert.ok(args.includes('-ExecutionPolicy'));
+  assert.ok(args.includes('Bypass'));
+});
+
+// ── o teto do envio, que precisa CRESCER com o lote ──────────────────────
+/**
+ * ⚠️ O teto fixo de 15 s foi a causa dos 20× de lentidão da RDF: o lote que
+ * não cabia era morto e refeito UMA A UMA, um processo por etiqueta. Trocar
+ * por outro número fixo só muda onde a fronteira cai.
+ */
+teste('o teto CRESCE com o número de etiquetas', () => {
+  assert.ok(tetoDoEnvioRaw(25) > tetoDoEnvioRaw(1));
+  assert.ok(tetoDoEnvioRaw(100) > tetoDoEnvioRaw(25));
+});
+
+teste('🚨 o lote de 25 tem teto maior que os 205 s medidos na ZD220', () => {
+  // Foi este o caso real: 25 etiquetas levaram 205 s no modo um-a-um porque
+  // o teto de 15 s as condenou. Com o teto proporcional, o lote inteiro
+  // numa chamada tem de ter folga acima disso.
+  assert.ok(tetoDoEnvioRaw(25) >= 150000, `teto de 25: ${tetoDoEnvioRaw(25)} ms`);
+});
+
+teste('a etiqueta AVULSA não espera o teto do lote cheio', () => {
+  // 99% dos jobs são de uma etiqueta: um teto generoso aqui deixaria o
+  // operador parado diante de um PowerShell travado.
+  assert.ok(tetoDoEnvioRaw(1) <= 30000, `teto de 1: ${tetoDoEnvioRaw(1)} ms`);
+});
+
+teste('⚠️ tem teto do teto — travamento de verdade AINDA vira erro', () => {
+  const enorme = tetoDoEnvioRaw(100000);
+  assert.ok(enorme <= 10 * 60 * 1000, `sem limite: ${enorme} ms`);
+  assert.strictEqual(enorme, tetoDoEnvioRaw(10000));
+});
+
+teste('valor inválido cai em UMA etiqueta, nunca em zero', () => {
+  // Zero significaria "sem timeout" no execFile — PowerShell pendurado para
+  // sempre e etiqueta que nunca volta para a fila.
+  for (const v of [0, -5, NaN, undefined, null, 'x']) {
+    assert.strictEqual(tetoDoEnvioRaw(v), tetoDoEnvioRaw(1), `entrada ${String(v)}`);
+  }
+});
+
 for (const [nome, fn] of casos) {
   try {
     fn();
@@ -140,3 +219,4 @@ for (const [nome, fn] of casos) {
   }
 }
 console.log(`\n${passaram}/${casos.length} casos`);
+
