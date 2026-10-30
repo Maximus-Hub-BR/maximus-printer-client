@@ -107,6 +107,40 @@ teste('🚨 o enfileirar DESCARTA job já impresso (a trava da duplicata do pull
   assert.ok(trecho.includes('agendarAcksPendentes()'), 'job já impresso tem de ser RECONFIRMADO');
 });
 
+teste('🚨 o registro marca ENVIANDO antes de qualquer byte sair', () => {
+  /*
+   * A duplicata de 30/10/2026 nasceu na janela entre "os bytes saíram" e
+   * "anotei que saíram": o app fechou no meio e a recuperação reimprimiu.
+   */
+  const inicio = posicao('imprimir: async (lote) => {');
+  const fim = posicao('confirmar: (item, status, erro) => {');
+  assert.ok(inicio > 0 && fim > inicio, 'não achei o imprimir da fila');
+  const corpo = main.slice(inicio, fim);
+  const marcou = corpo.indexOf('registroDeImpressao.marcarEnviando(');
+  const converteu = corpo.indexOf('Buffer.from(i.job.data');
+  assert.ok(marcou > 0, 'o lote não marca `enviando`');
+  assert.ok(marcou < converteu, 'o `enviando` tem de vir ANTES de preparar os bytes');
+});
+
+teste('🚨 o confirmar grava SÍNCRONO, não por debounce', () => {
+  const inicio = posicao('confirmar: (item, status, erro) => {');
+  const corpo = main.slice(inicio, inicio + 900).replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(corpo.includes('registroDeImpressao.salvar()'), 'o confirmar não grava na hora');
+  assert.ok(
+    !/marcarImpresso[\s\S]{0,120}agendarGravacaoDoRegistro\(\)/.test(corpo),
+    'voltou o debounce no caminho do desfecho: não sobrevive ao fechamento',
+  );
+});
+
+teste('🚨 job reoferecido pelo Hub é DESMARCADO para reconfirmar', () => {
+  /*
+   * Dois jobs voltavam em todo pull para sempre: o cliente os tinha como
+   * confirmados (PUBACK do broker) e nunca os reenviava; o Hub nunca soube.
+   */
+  const ocorrencias = (main.match(/registroDeImpressao\.precisaReconfirmar\(/g) || []).length;
+  assert.strictEqual(ocorrencias, 2, `esperava 2 (pull e fila), achei ${ocorrencias}`);
+});
+
 teste('🚨 o pull roda no connect, e os ACKs vão ANTES dele', () => {
   const trecho = main.slice(posicao("mqttClient.on('connect'"), posicao("mqttClient.on('message'"));
   const acks = trecho.indexOf('await enviarAcksPendentes()');
@@ -122,6 +156,29 @@ teste('⚠️ as rotinas periódicas existem e não dependem de evento de rede',
   assert.ok(main.includes('INTERVALO_DE_ACKS_MS'));
   assert.ok(main.includes('setInterval(() => void puxarPendentes()'));
   assert.ok(main.includes('setInterval(() => void enviarAcksPendentes()'));
+});
+
+teste('🚨 a falha da descoberta de impressoras vai para o LOG, não só para o console', () => {
+  /*
+   * 30/10/2026: o Leonardo instalou a versão nova, logou, e "não puxou
+   * nenhuma impressora". Não havia NENHUM rastro na máquina — o `catch` da
+   * descoberta escrevia só em `console.error`, que num app de bandeja
+   * ninguém lê. A causa só apareceu cruzando duas colunas do banco do
+   * SERVIDOR. Todo catch de borda tem de dizer o motivo onde alguém procura.
+   */
+  const inicio = posicao('async function descobrirImpressoras');
+  const fim = posicao('function detectarTipoImpressora');
+  assert.ok(inicio > 0 && fim > inicio, 'não achei a descoberta');
+  const corpo = main.slice(inicio, fim);
+  assert.ok(/registrar\(`\[impressoras\] FALHA/.test(corpo), 'a falha não é registrada no log');
+  assert.ok(/registrar\(`\[impressoras\] \$\{list\.length\}/.test(corpo), 'o sucesso não registra quantas achou');
+});
+
+teste('⚠️ o teto da descoberta é nomeado e generoso (uma fila ruim some com todas)', () => {
+  assert.ok(main.includes('TETO_DA_DESCOBERTA_MS'), 'o teto voltou a ser número solto');
+  const m = main.match(/const TETO_DA_DESCOBERTA_MS = (\d+)/);
+  assert.ok(m, 'não achei a constante');
+  assert.ok(Number(m[1]) >= 30000, `teto curto demais: ${m[1]} ms`);
 });
 
 teste('⚠️ o registro é gravado ao FECHAR o app', () => {
