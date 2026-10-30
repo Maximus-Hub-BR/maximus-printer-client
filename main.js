@@ -210,6 +210,35 @@ function conectarMqtt (token) {
     reconnectPeriod:    5000,
     connectTimeout:     15000,
     keepalive:          30,
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     * ⚠️ `clean: true` É DECISÃO MEDIDA — e o buraco que ela abre tem tampa
+     * ══════════════════════════════════════════════════════════════════════
+     * Sessão limpa significa que o que o Hub publica enquanto este cliente
+     * está fora NÃO é guardado por ninguém: o broker descarta (sessão limpa)
+     * e o Redis pub/sub não tem durabilidade. Em 30/10/2026 o agente
+     * `vaio77` ficou 32 segundos desconectado — das 12:12:09 às 12:12:41
+     * UTC — e **73 etiquetas publicadas nesse intervalo evaporaram**.
+     * Ficaram `sent` para sempre e o operador só percebeu contando o papel.
+     * Nos 14 dias anteriores foram 720 assim, em três computadores.
+     *
+     * `clean: false` parece a correção óbvia, e foi escrita e revertida no
+     * mesmo dia: a sessão do aedes vive na MEMÓRIA do broker e não tem teto
+     * por cliente. Uma etiqueta pesa ~50 KB; um agente esquecido ligado num
+     * balcão fechado acumularia centenas de megabytes de mensagens que
+     * ninguém quer mais — e derrubar o broker tira a impressão de TODO
+     * mundo, para salvar a de um.
+     *
+     * A tampa ficou no servidor, onde dá para impor limite: quando um agente
+     * reconecta, o Hub reentrega o que ficou sem ACK — com janela de 30 min,
+     * teto por reconexão e uma única reentrega por etiqueta. Ver
+     * `backend-novo/src/impressao/reenvio-de-jobs-sem-ack.ts`. Isso também
+     * vale para o parque inteiro HOJE, sem esperar o auto-update máquina a
+     * máquina.
+     *
+     * ⚠️ O `clientId` continua tendo de ser estável (`agent_<uid>_<uuid>`) —
+     * é por ele que o servidor sabe quem voltou.
+     */
     clean:              true,
     protocolVersion:    4,
   })
