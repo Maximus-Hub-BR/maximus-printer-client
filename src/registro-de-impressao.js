@@ -51,6 +51,15 @@ const HORAS_DE_MEMORIA = 24;
 const MAXIMO_DE_ENTRADAS = 5000;
 
 /**
+ * Quantas vezes uma MESMA etiqueta pode ir para a impressora por recuperação.
+ *
+ * ⚠️ Duas, não uma: a primeira tentativa pode ter morrido antes de o papel
+ * sair, e aí a segunda é a impressão de verdade. A terceira já seria teimosia
+ * — se duas saídas não resolveram, o problema não é falta de tentativa.
+ */
+const MAXIMO_DE_TENTATIVAS = 2;
+
+/**
  * Cria o registro.
  *
  * @param {object} portas
@@ -130,8 +139,26 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
      * a um fechamento que aconteça nos próximos milissegundos.
      */
     marcarEnviando(jobUuid) {
-      if (!jobUuid || dados[jobUuid]) return;
-      dados[jobUuid] = { em: agora(), estado: 'enviando', status: null, erro: null, confirmado: false };
+      if (!jobUuid) return;
+      const anterior = dados[jobUuid];
+      // Job que já teve desfecho não volta para `enviando`.
+      if (anterior && anterior.estado !== 'enviando') return;
+      dados[jobUuid] = {
+        em: anterior ? anterior.em : agora(),
+        estado: 'enviando',
+        status: null,
+        erro: null,
+        confirmado: false,
+        /*
+         * ⚠️ O CONTADOR é o que impede a avalanche de papel. Achado pelo
+         * ensaio de caos: um job que morre SEMPRE depois do envio (o papel
+         * saiu, o registro não soube) é reoferecido pelo pull e reimpresso
+         * de novo, e de novo — foram 4 saídas da mesma etiqueta numa das
+         * sementes. Sem teto, uma máquina instável vira uma pilha de
+         * duplicatas.
+         */
+        tentativas: (anterior && anterior.tentativas ? anterior.tentativas : 0) + 1,
+      };
       salvar();
     },
 
@@ -180,6 +207,22 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
       if (dados[jobUuid]) dados[jobUuid].confirmado = true;
     },
 
+    /**
+     * Pode mandar este job para a impressora de novo?
+     *
+     * ⚠️ `false` NÃO é "esqueça": é "pare de reimprimir sozinho". O job fica
+     * no Hub como não confirmado e aparece na tela como "enviada e não
+     * confirmada" — e aí **uma pessoa** decide, olhando o papel que tem na
+     * mão. Entre uma pilha de duplicatas automáticas e uma linha na tela
+     * pedindo conferência, a segunda é sempre melhor.
+     */
+    podeReimprimir(jobUuid, maximo = MAXIMO_DE_TENTATIVAS) {
+      const item = jobUuid && dados[jobUuid];
+      if (!item) return true;
+      if (item.estado !== 'enviando') return false;
+      return (item.tentativas || 1) < maximo;
+    },
+
     /** Os ACKs que o Hub ainda não aceitou — o que vai por HTTP. */
     pendentesDeConfirmacao() {
       return Object.entries(dados)
@@ -198,4 +241,9 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
   };
 }
 
-module.exports = { criarRegistroDeImpressao, HORAS_DE_MEMORIA, MAXIMO_DE_ENTRADAS };
+module.exports = {
+  criarRegistroDeImpressao,
+  HORAS_DE_MEMORIA,
+  MAXIMO_DE_ENTRADAS,
+  MAXIMO_DE_TENTATIVAS,
+};

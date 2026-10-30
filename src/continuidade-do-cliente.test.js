@@ -151,6 +151,21 @@ teste('🚨 o pull roda no connect, e os ACKs vão ANTES dele', () => {
   assert.ok(trecho.includes('ligarRotinasDeContinuidade()'));
 });
 
+teste('🚨 o pull respeita o TETO de tentativas (não vira pilha de duplicatas)', () => {
+  assert.ok(main.includes('registroDeImpressao.podeReimprimir('), 'o pull não consulta o teto');
+});
+
+teste('🚨 limite esgotado vira ERRO visível, nunca "sucesso"', () => {
+  /*
+   * Confirmar como impressa uma etiqueta que talvez não tenha saído a faria
+   * SUMIR da tela — e aí a perda volta a ser silenciosa, que é o defeito
+   * original de 30/10/2026.
+   */
+  const trecho = main.slice(posicao('async function puxarPendentes'), posicao('function ligarRotinasDeContinuidade'));
+  assert.ok(/marcarImpresso\([\s\S]{0,80}'error'/.test(trecho), 'o limite não marca erro');
+  assert.ok(trecho.includes('confira o papel'), 'a mensagem não diz o que a pessoa deve fazer');
+});
+
 teste('⚠️ as rotinas periódicas existem e não dependem de evento de rede', () => {
   assert.ok(main.includes('INTERVALO_DE_PULL_MS'), 'sem pull periódico, só a reconexão recupera');
   assert.ok(main.includes('INTERVALO_DE_ACKS_MS'));

@@ -685,6 +685,7 @@ async function puxarPendentes () {
     if (!jobs.length) return
     let enfileirados = 0
     let jaImpressos = 0
+    let naoResolvidos = 0
     for (const job of jobs) {
       if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
         /*
@@ -693,7 +694,39 @@ async function puxarPendentes () {
          * BROKER, não registro no Hub). Sem desmarcar, o job voltava em todo
          * pull para sempre: medido em 30/10/2026, dois ficaram nesse laço a
          * cada 2 minutos, e na tela como "não confirmada" que nunca some.
+         *
+         * ⚠️ Job em `enviando` é outra história: o processo morreu entre o
+         * papel sair e o registro saber, e é impossível dizer se saiu.
+         * Reimprime — mas no máximo UMA vez a mais (ver
+         * `podeReimprimir`): sem teto, uma máquina instável vira pilha de
+         * duplicatas. Esgotado o limite, quem decide é a pessoa, pela tela.
          */
+        if (registroDeImpressao.podeReimprimir(job.job_uuid)) {
+          enfileirar(job, userId)
+          enfileirados++
+          continue
+        }
+        /*
+         * 🚨 Limite esgotado: o cliente PARA de reimprimir — mas o desfecho
+         * é um ERRO, nunca um "sucesso". Confirmar como impressa uma
+         * etiqueta que talvez não tenha saído a faria SUMIR da tela, e aí a
+         * perda volta a ser silenciosa, que é o defeito original de
+         * 30/10/2026. Como erro, ela aparece para a pessoa conferir o papel
+         * e decidir — que é a única coisa honesta a fazer quando o sistema
+         * não sabe.
+         */
+        if (registroDeImpressao.estadoDe(job.job_uuid) === 'enviando') {
+          registroDeImpressao.marcarImpresso(
+            job.job_uuid,
+            'error',
+            'o app foi encerrado durante o envio e o limite de tentativas acabou — confira o papel',
+          )
+          registroDeImpressao.salvar()
+          registrar(`[pull] ${job.job_uuid}: limite de tentativas atingido — marcado para conferência`)
+          naoResolvidos++
+          agendarAcksPendentes()
+          continue
+        }
         registroDeImpressao.precisaReconfirmar(job.job_uuid)
         jaImpressos++
         continue
@@ -704,7 +737,8 @@ async function puxarPendentes () {
     if (jaImpressos) agendarAcksPendentes()
     registrar(
       `[pull] ${jobs.length} pendente(s) no Hub: ${enfileirados} para imprimir, ` +
-        `${jaImpressos} já impresso(s) (reconfirmando)`,
+        `${jaImpressos} já impresso(s) (reconfirmando)` +
+        (naoResolvidos ? `, ${naoResolvidos} para CONFERÊNCIA (limite de tentativas)` : ''),
     )
   } catch (erro) {
     const detalhe = erro && erro.response ? `HTTP ${erro.response.status}` : (erro && erro.message) || erro
