@@ -943,15 +943,41 @@ async function gerarPdfTeste () {
 async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1) {
   if (zplHost) {
     // Impressora de rede: TCP direto na porta 9100
+    /*
+     * ⚠️ O TETO AQUI TAMBÉM É PROPORCIONAL AO LOTE (30/10/2026).
+     *
+     * Este caminho tinha `10000` fixo — a MESMA incoerência que acabou de ser
+     * corrigida no envio por winspool, e pela mesma razão: `socket.write` só
+     * completa quando o buffer do SO drena, e numa térmica lenta isso espera
+     * a impressão. Um lote de 25 etiquetas gráficas é 1,2 MB; de 100, quase 5
+     * MB. Teto fixo transforma lote grande em erro, e erro aqui é a etiqueta
+     * voltando para a fila sem necessidade.
+     *
+     * ⚠️ Nenhuma das 184 impressoras cadastradas usa `zpl_host` hoje (medido),
+     * então este caminho nunca foi exercitado em volume — motivo de sobra
+     * para ele não carregar um limite que já se mostrou errado do outro lado.
+     *
+     * ⚠️ O temporizador é CANCELADO no fim: antes ele continuava pendurado
+     * mesmo após o sucesso, e num lote isso deixava um timer vivo por
+     * impressão, cada um com um `socket.destroy()` agendado.
+     */
     await new Promise((resolve, reject) => {
       const net = require('net')
+      let relogio = null
+      const encerrar = (fn, arg) => {
+        if (relogio) { clearTimeout(relogio); relogio = null }
+        fn(arg)
+      }
       const socket = net.createConnection({ host: zplHost, port: zplPort }, () => {
         socket.write(buffer)
         socket.end()
       })
-      socket.on('close', resolve)
-      socket.on('error', reject)
-      setTimeout(() => { socket.destroy(); reject(new Error('Timeout TCP ZPL')) }, 10000)
+      socket.on('close', () => encerrar(resolve))
+      socket.on('error', (erro) => encerrar(reject, erro))
+      relogio = setTimeout(() => {
+        socket.destroy()
+        encerrar(reject, new Error(`Timeout TCP ZPL (${etiquetas} etiqueta(s), teto ${tetoDoEnvioRaw(etiquetas)} ms)`))
+      }, tetoDoEnvioRaw(etiquetas))
     })
   } else if (canalDeZpl(process.platform, null) === 'winspool') {
     // Driver Windows: envio RAW pelo spooler (winspool).
