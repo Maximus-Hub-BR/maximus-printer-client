@@ -30,6 +30,43 @@ let trayStatus      = 'desconectado'
 let updateDownloaded = false
 let autoUpdater     = null
 
+// ─── Instância única ─────────────────────────────────────────────────────────
+//
+// ══════════════════════════════════════════════════════════════════════════
+// 🚨 DUAS INSTÂNCIAS BRIGAM PELO MESMO clientId — E A BRIGA APAGA IMPRESSORA
+// ══════════════════════════════════════════════════════════════════════════
+// A janela fecha para a bandeja (`window-all-closed` é prevenido) e o app
+// abre sozinho no login do Windows (`openAtLogin`). Quem clica no atalho
+// porque "não está aberto" sobe uma SEGUNDA instância — com o mesmo
+// `agent_uuid` do electron-store e o mesmo usuário.
+//
+// O clientId do MQTT é `agent_<uid>_<uuid>`: duas conexões com o mesmo id
+// fazem o broker derrubar uma toda vez que a outra entra, e o derrubado volta
+// em 5 s (`reconnectPeriod`). Medido em 30/10/2026 no agente 33 (`vaio77`):
+// ~20 takeovers entre 11:24:49 e 11:26:35 UTC.
+//
+// Cada reconexão disparava um sync de impressoras, e um deles chegou ao
+// servidor com a lista VAZIA — apagando as 4 impressoras do agente, que
+// voltaram sem tipo, sem compartilhamento e sem `shared_with_account`.
+//
+// ⚠️ O lock tem de vir ANTES do `whenReady`: pedir depois deixa a segunda
+// instância subir, conectar no MQTT e só então sair.
+if (!app.requestSingleInstanceLock()) {
+  app.quit()
+} else {
+  // Clicou no atalho de novo: em vez de abrir outro app, traz a janela.
+  app.on('second-instance', () => {
+    if (setupWin) {
+      if (setupWin.isMinimized()) setupWin.restore()
+      setupWin.focus()
+    } else if (store && store.get('token')) {
+      abrirSetup()
+    } else {
+      abrirLogin()
+    }
+  })
+}
+
 // ─── Boot ────────────────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {
@@ -710,6 +747,21 @@ async function registrarAgente (token) {
 
 // ─── Descoberta de impressoras ────────────────────────────────────────────────
 
+/**
+ * Lista as impressoras do SO — ou `null` quando NÃO FOI POSSÍVEL perguntar.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 `[]` SIGNIFICA "ESTE PC NÃO TEM IMPRESSORA", NÃO "DEU ERRO"
+ * ══════════════════════════════════════════════════════════════════════════
+ * A versão anterior devolvia `[]` em qualquer falha — timeout de 10 s do
+ * `powershell Get-Printer`, spooler ainda subindo logo depois do boot, saída
+ * que não faz `JSON.parse`. O servidor lê lista vazia como ordem de apagar
+ * todas as impressoras do agente, então um erro transitório AQUI virava
+ * perda permanente de configuração LÁ (incidente de 30/10/2026).
+ *
+ * Quem chama decide: o sync não envia nada quando isto devolve `null`; a
+ * tela mostra a lista que conseguir.
+ */
 async function descobrirImpressoras () {
   try {
     if (process.platform === 'win32') {
@@ -739,8 +791,9 @@ async function descobrirImpressoras () {
       }))
     }
   } catch (err) {
+    // ⚠️ `null`, nunca `[]` — ver o cabeçalho desta função.
     console.error('[PRINTERS] Erro ao descobrir impressoras:', err.message)
-    return []
+    return null
   }
 }
 
@@ -751,16 +804,46 @@ function detectarTipoImpressora (name) {
   return 'auto'
 }
 
-async function sincronizarImpressoras (token, agentUuid) {
+/** Instante do último sync que REALMENTE foi ao servidor. */
+let ultimoSyncEm = 0
+// A regra mora em `src/decisao-de-sync.js`, com teste — não duplicar aqui.
+const { listaPodeSerPublicada, podeSincronizarAgora } = require('./src/decisao-de-sync')
+
+/**
+ * Manda ao Hub a lista de impressoras deste PC.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * ⚠️ DUAS RECUSAS, E AS DUAS EXISTEM POR CAUSA DO INCIDENTE DE 30/10/2026
+ * ══════════════════════════════════════════════════════════════════════════
+ *  1. **Descoberta que falhou não vira POST.** `descobrirImpressoras`
+ *     devolve `null` quando não conseguiu perguntar ao SO; mandar isso como
+ *     `[]` fazia o servidor apagar todas as impressoras do agente.
+ *  2. **Reconexão de rede não sincroniza.** O sync roda no `connect` do
+ *     MQTT, que acontece a cada 5 s enquanto houver instabilidade (ou briga
+ *     de clientId). A lista de impressoras de um PC não muda nesse ritmo —
+ *     `forcar: true` é para o clique do "Salvar", onde a pessoa espera que
+ *     o que ela acabou de instalar apareça.
+ */
+async function sincronizarImpressoras (token, agentUuid, { forcar = false } = {}) {
+  const agora = Date.now()
+  if (!podeSincronizarAgora({ agora, ultimoSyncEm, forcar })) return null
+
   try {
     const printers = await descobrirImpressoras()
-    await axios.post(
+    if (!listaPodeSerPublicada(printers)) {
+      console.error('[SYNC] descoberta falhou — POST não enviado (lista vazia apagaria o agente)')
+      return null
+    }
+    const res = await axios.post(
       `${HUB_API}/print-agents/${agentUuid}/printers`,
       { printers },
       { headers: { Authorization: `Bearer ${token}` } }
     )
+    ultimoSyncEm = agora
+    return res.data
   } catch (err) {
     console.error('[SYNC] Erro ao sincronizar impressoras:', err.message)
+    return null
   }
 }
 
@@ -793,7 +876,9 @@ ipcMain.handle('login', async (_, { email, password }) => {
 })
 
 ipcMain.handle('get-printers', async () => {
-  return await descobrirImpressoras()
+  // A tela só EXIBE: aqui `null` vira lista vazia e aparece o "Nenhuma
+  // impressora encontrada". Nada é apagado por este caminho.
+  return (await descobrirImpressoras()) || []
 })
 
 ipcMain.handle('get-hub-printers', async () => {
@@ -828,13 +913,17 @@ ipcMain.handle('sync-printers', async () => {
   if (!token) return { success: false, data: [], message: 'Não autenticado' }
   try {
     await registrarAgente(token)
-    const printers = await descobrirImpressoras()
-    const res = await axios.post(
-      `${HUB_API}/print-agents/${agentUuid}/printers`,
-      { printers },
-      { headers: { Authorization: `Bearer ${token}` } }
-    )
-    return { success: true, data: res.data.data || [] }
+    // `forcar`: é clique de gente no "Salvar", não reconexão de rede.
+    const resposta = await sincronizarImpressoras(token, agentUuid, { forcar: true })
+    if (!resposta) {
+      return {
+        success: false,
+        data: [],
+        message: 'Não foi possível ler as impressoras deste computador agora. '
+               + 'Tente de novo em instantes — nada foi alterado no Hub.',
+      }
+    }
+    return { success: true, data: resposta.data || [] }
   } catch (err) {
     const msg = err.response?.data?.message || err.message
     return { success: false, data: [], message: msg }
