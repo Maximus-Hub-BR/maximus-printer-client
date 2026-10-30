@@ -4,6 +4,10 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('hub', {
   login:          (data)   => ipcRenderer.invoke('login', data),
+  // Segundo fator: o login pode terminar em DUAS etapas desde que o 2FA
+  // entrou no Hub (ver `src/resposta-de-login.js`).
+  loginCodigo:    (data)   => ipcRenderer.invoke('login-codigo', data),
+  loginReenviar:  (data)   => ipcRenderer.invoke('login-reenviar-codigo', data),
   logout:         ()       => ipcRenderer.invoke('logout'),
   getPrinters:    ()       => ipcRenderer.invoke('get-printers'),
   getHubPrinters: ()       => ipcRenderer.invoke('get-hub-printers'),

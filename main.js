@@ -371,6 +371,7 @@ function registrar (mensagem) {
 // que o `node --check` NÃO acusa, porque ele só vê sintaxe. O caso que trava
 // isso está em `src/registro-de-impressao.test.js`.
 const { criarRegistroDeImpressao } = require('./src/registro-de-impressao')
+const { interpretarLogin, metodosQuePrecisamEnvio, mensagemDeConfiguracao } = require('./src/resposta-de-login')
 
 /**
  * O REGISTRO do que já saiu no papel — `src/registro-de-impressao.js`.
@@ -1259,31 +1260,168 @@ async function sincronizarImpressoras (token, agentUuid, { forcar = false } = {}
 
 // ─── IPC — comunicação com páginas HTML ──────────────────────────────────────
 
+/**
+ * Conclui o login: guarda a sessão, registra o agente e conecta.
+ *
+ * ⚠️ Ponto ÚNICO de "entrei": o login direto e o login com segundo fator
+ * terminam aqui. Duas cópias disso significariam um caminho que esquece de
+ * registrar o agente ou de ligar as rotinas de continuidade — e o sintoma
+ * seria o cliente conectado que nunca imprime.
+ */
+async function concluirLogin (sessao) {
+  store.set('token',   sessao.token)
+  store.set('user_id', sessao.usuario.id)
+  store.set('user_name', sessao.usuario.name || sessao.usuario.email)
+  /*
+   * ⚠️ O aparelho CONFIÁVEL é o que faz o 2FA ser pedido uma vez e não toda
+   * semana. O Hub devolve este token quando o cliente pede para confiar, e
+   * ele volta no cabeçalho `x-trusted-device` do próximo login — que então
+   * pula o código. Guardar é o ponto inteiro do recurso.
+   */
+  if (sessao.dispositivoConfiavel) store.set('trusted_device', sessao.dispositivoConfiavel)
+
+  await registrarAgente(sessao.token)
+  conectarMqtt(sessao.token)
+
+  if (loginWin) { loginWin.close(); loginWin = null }
+  abrirSetup()
+
+  verificarAtualizacao()
+  setInterval(verificarAtualizacao, 5 * 60 * 1000)
+}
+
+/** O desafio de 2FA em curso — vive só entre a senha e o código. */
+let desafioEmCurso = null
+
 ipcMain.handle('login', async (_, { email, password }) => {
   try {
-    const res = await axios.post(`${HUB_API}/auth/login`, { email, password })
-    const { token: { token }, user } = res.data.data
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     * 🚨 O HUB TEM TRÊS RESPOSTAS PARA O LOGIN (30/10/2026)
+     * ══════════════════════════════════════════════════════════════════════
+     * Este handler lia `res.data.data.token.token` direto, e a tela mostrava
+     * "Cannot read properties of undefined (reading 'token')" para qualquer
+     * conta de pessoa — porque desde o 2FA o login também responde
+     * `mfa_required` e `mfa_setup_required`, que não têm `token`. O Hub
+     * ACEITAVA a credencial; quem recusava era o nosso código, por não saber
+     * ler a resposta. A regra de leitura está em `src/resposta-de-login.js`,
+     * com teste.
+     */
+    const confiavel = store.get('trusted_device')
+    const res = await axios.post(
+      `${HUB_API}/auth/login`,
+      { email, password },
+      // O cabeçalho é o que faz o aparelho já conhecido pular o código.
+      confiavel ? { headers: { 'x-trusted-device': confiavel } } : undefined,
+    )
+    const r = interpretarLogin(res.data && res.data.data)
 
-    store.set('token',   token)
-    store.set('user_id', user.id)
-    store.set('user_name', user.name || user.email)
+    if (r.tipo === 'sessao') {
+      await concluirLogin(r)
+      return { success: true }
+    }
 
-    await registrarAgente(token)
-    conectarMqtt(token)
+    if (r.tipo === 'codigo') {
+      desafioEmCurso = { desafio: r.desafio, email }
+      registrar(`[login] 2FA pedido para ${email} (${r.metodos.length} método(s))`)
+      return {
+        success: false,
+        precisaCodigo: true,
+        expiraEmMin: r.expiraEmMin,
+        backupDisponiveis: r.backupDisponiveis,
+        // Só os que dependem de envio viram botão na tela.
+        metodosParaEnviar: metodosQuePrecisamEnvio(r.metodos).map((m) => ({
+          id: m.id,
+          rotulo: m.label || m.rotulo || m.destino || m.type || m.tipo,
+        })),
+      }
+    }
 
-    if (loginWin) { loginWin.close(); loginWin = null }
-    abrirSetup()
+    if (r.tipo === 'configurar') {
+      /*
+       * ⚠️ O Print Client NÃO configura 2FA, de propósito: é app de balcão,
+       * a máquina costuma ser compartilhada, e o segredo de autenticação de
+       * uma pessoa não tem onde ficar guardado com segurança aqui. O que ele
+       * faz é dizer para onde ir.
+       */
+      registrar(`[login] conta ${email} precisa configurar 2FA no Hub`)
+      return { success: false, message: mensagemDeConfiguracao(r) }
+    }
 
-    // Inicia verificação de atualização após login
-    verificarAtualizacao()
-    setInterval(verificarAtualizacao, 5 * 60 * 1000)
-
-    return { success: true }
+    registrar('[login] resposta do Hub em formato desconhecido')
+    return { success: false, message: 'Não foi possível entrar: resposta inesperada do servidor.' }
   } catch (err) {
     const msg = err.response?.data?.message || err.message
     return { success: false, message: msg }
   }
 })
+
+/**
+ * Conclui o login com o código do segundo fator.
+ *
+ * ⚠️ `confiar_dispositivo: true` SEMPRE. Esta é uma máquina de balcão que
+ * imprime o dia inteiro: pedir o código a cada login transformaria a
+ * verificação em obstáculo diário e levaria alguém a deixar a senha colada no
+ * monitor. O Hub devolve um token de aparelho confiável, que guardamos e
+ * reapresentamos no próximo login.
+ *
+ * ⚠️ O MESMO campo aceita o número do app, o código enviado por e-mail ou
+ * WhatsApp e o código de recuperação — é o servidor que descobre o que é.
+ * Separar em três campos obrigaria quem está no balcão a saber qual tem.
+ */
+ipcMain.handle('login-codigo', async (_, { codigo }) => {
+  if (!desafioEmCurso) {
+    return { success: false, message: 'A verificação expirou. Entre com e-mail e senha de novo.' }
+  }
+  try {
+    const res = await axios.post(`${HUB_API}/auth/mfa/verify`, {
+      challenge: desafioEmCurso.desafio,
+      codigo: String(codigo || '').trim(),
+      confiar_dispositivo: true,
+    })
+    const r = interpretarLogin(res.data && res.data.data)
+    if (r.tipo !== 'sessao') {
+      return { success: false, message: 'Não foi possível concluir a verificação.' }
+    }
+    desafioEmCurso = null
+    await concluirLogin(r)
+    registrar(`[login] 2FA concluído${r.dispositivoConfiavel ? ' — aparelho lembrado' : ''}`)
+    return { success: true }
+  } catch (err) {
+    /*
+     * ⚠️ Nenhuma rota do fluxo responde 401 (decisão do backend): código
+     * errado é 400, excesso é 429 e desafio morto é 400 com `expirado`. Por
+     * isso dá para mostrar a mensagem do servidor direto — ela é feita para
+     * quem está tentando entrar.
+     */
+    const dados = err.response?.data
+    const expirou = dados?.expirado === true
+    if (expirou) desafioEmCurso = null
+    return {
+      success: false,
+      expirou,
+      message: dados?.message || err.message,
+      tentativasRestantes: dados?.tentativas_restantes,
+    }
+  }
+})
+
+/** Reenvia o código por e-mail/WhatsApp (o do app não precisa). */
+ipcMain.handle('login-reenviar-codigo', async (_, { methodId } = {}) => {
+  if (!desafioEmCurso) {
+    return { success: false, message: 'A verificação expirou. Entre com e-mail e senha de novo.' }
+  }
+  try {
+    const res = await axios.post(`${HUB_API}/auth/mfa/challenge/send`, {
+      challenge: desafioEmCurso.desafio,
+      ...(methodId ? { method_id: methodId } : {}),
+    })
+    return { success: true, message: res.data?.message || 'Código enviado.' }
+  } catch (err) {
+    return { success: false, message: err.response?.data?.message || err.message }
+  }
+})
+
 
 ipcMain.handle('get-printers', async () => {
   // A tela só EXIBE: aqui `null` vira lista vazia e aparece o "Nenhuma
