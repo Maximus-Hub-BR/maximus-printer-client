@@ -170,6 +170,43 @@ teste('a lista também não executa profile nem política', () => {
   assert.ok(args.includes('Bypass'));
 });
 
+// ── encoding: o script tem de ser 100% ASCII ─────────────────────────────
+/**
+ * 🚨 **O PowerShell 5.1 lê `.ps1` SEM BOM como ANSI** (30/10/2026, achado na
+ * VM de teste). Um travessão `—` (UTF-8 `E2 80 94`) vira `â€"` na leitura, e
+ * o `"` do meio **fecha a string**: o parser morre com "Token inesperado" e o
+ * comando nunca chega à impressora — exatamente o sintoma silencioso que já
+ * quebrou o envio três vezes neste projeto (1.0.5 a 1.0.8).
+ *
+ * ⚠️ E aqui o defeito seria pior que um erro de parse: o script é gravado com
+ * `fs.writeFileSync(..., 'ascii')`, e o Node converte caractere não-ASCII em
+ * `?` **sem reclamar**. O arquivo sairia sintaticamente plausível e
+ * semanticamente lixo.
+ *
+ * A expedição roda Windows com PowerShell 5.1, então isto não é teórico.
+ */
+teste('🚨 o script é 100% ASCII (PS 5.1 lê .ps1 sem BOM como ANSI)', () => {
+  const foras = [];
+  for (let i = 0; i < script.length; i += 1) {
+    const codigo = script.charCodeAt(i);
+    if (codigo > 127) foras.push(`${JSON.stringify(script[i])} (U+${codigo.toString(16)}) na posição ${i}`);
+  }
+  assert.deepStrictEqual(foras, [], `caractere não-ASCII no script: ${foras.join(', ')}`);
+});
+
+teste('⚠️ gravar em ASCII vira CARACTERE DE CONTROLE, não "?" — e isso é pior', () => {
+  /*
+   * Medido: `Buffer.from(texto, 'ascii')` faz MASK DE 7 BITS, não
+   * substituição. O travessão `—` (U+2014) vira `\u0014` (DC4), um caractere
+   * de CONTROLE invisível no meio do `.ps1` — não um `?` que alguém notaria
+   * lendo o arquivo. Some na tela, quebra o script, e o envio falha calado.
+   */
+  const comoAscii = Buffer.from('comentario — com travessao', 'ascii').toString();
+  assert.ok(!comoAscii.includes('—'), 'o travessão não sobrevive ao ascii');
+  assert.ok(comoAscii.includes('\u0014'), `esperava DC4, veio: ${JSON.stringify(comoAscii)}`);
+  assert.ok(!comoAscii.includes('?'), 'não é troca por "?" — é mask de 7 bits');
+});
+
 // ── o teto do envio, que precisa CRESCER com o lote ──────────────────────
 /**
  * ⚠️ O teto fixo de 15 s foi a causa dos 20× de lentidão da RDF: o lote que

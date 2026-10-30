@@ -45,6 +45,15 @@
       vertical-align: middle; margin-right: 6px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .ajuda { color: #9aa4b2; font-size: 12px; line-height: 1.5; }
+    button.link {
+      background: none; border: none; color: #9aa4b2; text-decoration: underline;
+      cursor: pointer; font-size: 12px; padding: 6px 0; width: auto; margin-top: 4px;
+    }
+    button.secundario {
+      background: #2a3140; color: #d7dde7; font-size: 13px; padding: 8px 10px;
+      width: auto; margin-right: 6px;
+    }
   </style>
 </head>
 <body>
@@ -62,14 +71,42 @@
       <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" />
     </div>
     <button id="btn" onclick="fazerLogin()">Entrar</button>
+
+    <!-- ══════════════════════════════════════════════════════════════════
+         ETAPA 2 — o código do segundo fator.
+         Fica escondida até o Hub pedir. O MESMO campo aceita o número do
+         app, o código por e-mail/WhatsApp e o código de recuperação: é o
+         servidor que descobre o que é, e quem está no balcão digita o que
+         tem em mãos.
+         ══════════════════════════════════════════════════════════════════ -->
+    <div id="etapa-codigo" style="display:none">
+      <div>
+        <label>Código de verificação</label>
+        <input id="codigo" inputmode="numeric" autocomplete="one-time-code"
+               placeholder="000000" maxlength="20" />
+      </div>
+      <div id="ajuda-codigo" class="ajuda"></div>
+      <button id="btn-codigo" onclick="enviarCodigo()">Confirmar</button>
+      <div id="reenviar" style="margin-top:10px"></div>
+      <div class="ajuda" style="margin-top:10px">
+        Este computador será lembrado — o código não será pedido de novo nele.
+      </div>
+      <button class="link" onclick="voltarParaSenha()">voltar</button>
+    </div>
   </div>
 
   <script>
     const btn   = document.getElementById('btn')
     const err   = document.getElementById('error')
 
+    const etapaCodigo = document.getElementById('etapa-codigo')
+    const btnCodigo   = document.getElementById('btn-codigo')
+
+    /* Enter envia a etapa que estiver na tela. */
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') fazerLogin()
+      if (e.key !== 'Enter') return
+      if (etapaCodigo.style.display === 'none') fazerLogin()
+      else enviarCodigo()
     })
 
     async function fazerLogin () {
@@ -84,11 +121,89 @@
       const res = await window.hub.login({ email, password })
       if (res.success) {
         btn.innerHTML = '✓ Conectado!'
-      } else {
-        btn.disabled = false
-        btn.innerHTML = 'Entrar'
-        mostrarErro(res.message || 'Erro ao conectar.')
+        return
       }
+
+      /* O Hub pediu o segundo fator: a senha estava certa. */
+      if (res.precisaCodigo) {
+        mostrarEtapaDoCodigo(res)
+        return
+      }
+
+      btn.disabled = false
+      btn.innerHTML = 'Entrar'
+      mostrarErro(res.message || 'Erro ao conectar.')
+    }
+
+    function mostrarEtapaDoCodigo (res) {
+      document.getElementById('email').disabled = true
+      document.getElementById('password').disabled = true
+      btn.style.display = 'none'
+      etapaCodigo.style.display = 'block'
+      err.style.display = 'none'
+
+      const partes = []
+      if (res.expiraEmMin) partes.push(`O código vale por ${res.expiraEmMin} minutos.`)
+      if (res.backupDisponiveis) partes.push('Você também pode usar um código de recuperação.')
+      document.getElementById('ajuda-codigo').textContent = partes.join(' ')
+
+      /* Só quem depende de ENVIO ganha botão — o código do app já está lá. */
+      const area = document.getElementById('reenviar')
+      area.innerHTML = ''
+      for (const metodo of res.metodosParaEnviar || []) {
+        const b = document.createElement('button')
+        b.className = 'secundario'
+        b.textContent = `Enviar por ${metodo.rotulo}`
+        b.onclick = () => reenviar(metodo.id, b)
+        area.appendChild(b)
+      }
+
+      document.getElementById('codigo').focus()
+    }
+
+    async function enviarCodigo () {
+      const codigo = document.getElementById('codigo').value.trim()
+      if (!codigo) return mostrarErro('Digite o código.')
+
+      btnCodigo.disabled = true
+      btnCodigo.innerHTML = '<span class="spinner"></span>Confirmando...'
+      err.style.display = 'none'
+
+      const res = await window.hub.loginCodigo({ codigo })
+      if (res.success) {
+        btnCodigo.innerHTML = '✓ Conectado!'
+        return
+      }
+
+      btnCodigo.disabled = false
+      btnCodigo.innerHTML = 'Confirmar'
+      let msg = res.message || 'Código inválido.'
+      if (res.tentativasRestantes !== undefined) {
+        msg += ` (${res.tentativasRestantes} tentativa(s) restante(s))`
+      }
+      mostrarErro(msg)
+      /* Desafio morto: a pessoa precisa recomeçar, e tem de saber disso. */
+      if (res.expirou) voltarParaSenha()
+    }
+
+    async function reenviar (methodId, botao) {
+      const rotuloOriginal = botao.textContent
+      botao.disabled = true
+      botao.textContent = 'Enviando...'
+      const res = await window.hub.loginReenviar({ methodId })
+      botao.textContent = res.success ? 'Enviado ✓' : rotuloOriginal
+      botao.disabled = false
+      if (!res.success) mostrarErro(res.message || 'Não foi possível enviar o código.')
+    }
+
+    function voltarParaSenha () {
+      etapaCodigo.style.display = 'none'
+      btn.style.display = 'block'
+      btn.disabled = false
+      btn.innerHTML = 'Entrar'
+      document.getElementById('email').disabled = false
+      document.getElementById('password').disabled = false
+      document.getElementById('codigo').value = ''
     }
 
     function mostrarErro (msg) {

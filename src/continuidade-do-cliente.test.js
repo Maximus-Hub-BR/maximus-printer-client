@@ -57,6 +57,28 @@ teste('🚨 o lote informa QUANTAS etiquetas vão no fluxo', () => {
   );
 });
 
+teste('🚨 o caminho TCP 9100 também tem teto PROPORCIONAL, não fixo', () => {
+  /*
+   * O winspool foi corrigido primeiro e o TCP ficou com `10000` fixo — a
+   * mesma classe de defeito do outro lado. Nenhuma impressora usa `zpl_host`
+   * hoje, o que torna mais fácil (e mais barato) acertar antes do primeiro
+   * uso em volume.
+   */
+  const inicio = posicao('if (zplHost) {');
+  const fim = posicao("} else if (canalDeZpl(");
+  assert.ok(inicio > 0 && fim > inicio, 'não achei o ramo TCP do imprimirZpl');
+  const ramo = main.slice(inicio, fim).replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(ramo.includes('tetoDoEnvioRaw(etiquetas)'), 'o teto do TCP não depende do lote');
+  assert.ok(!/setTimeout\([\s\S]*?,\s*\d{3,}\s*\)/.test(ramo), 'voltou um teto FIXO no TCP');
+});
+
+teste('⚠️ o temporizador do TCP é cancelado (não fica pendurado por impressão)', () => {
+  const inicio = posicao('if (zplHost) {');
+  const fim = posicao("} else if (canalDeZpl(");
+  const ramo = main.slice(inicio, fim);
+  assert.ok(ramo.includes('clearTimeout(relogio)'), 'o timer do TCP não é cancelado');
+});
+
 teste('🚨 o confirmar GRAVA no registro antes de falar com a rede', () => {
   const gravou = posicao('registroDeImpressao.marcarImpresso(item.job.job_uuid, status, erro)');
   const publicou = posicao('`hub/ack/${item.userId}/${item.job.job_uuid}`');
