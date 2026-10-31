@@ -182,7 +182,73 @@ teste('nada fica pendente ao fim de uma rajada', async () => {
 });
 
 (async () => {
-  for (const [nome, fn] of casos) {
+  /*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 11 ETIQUETAS PARA 6 PEDIDOS — o mesmo job por dois caminhos
+ * ══════════════════════════════════════════════════════════════════════════
+ * Medido no print.log da RDF em 31/10/2026: o MQTT publicou 6 e o pull
+ * entregou as mesmas 6 no mesmo segundo (nenhuma tinha ACK ainda). As duas
+ * cópias entraram na fila e o papel saiu em dobro — 11 ACKs para 6 uuids.
+ */
+
+teste('🚨 o MESMO job_uuid não entra duas vezes na fila', async () => {
+  const { fila, lotes } = montar();
+  const primeira = fila.enfileirar(job('u-1'), 9);
+  fila.enfileirar(job('u-1'), 9);   // mesma entrega, outro caminho
+  await primeira;
+  await pausa(30);
+  const saidas = lotes.flatMap((l) => l.uuids);
+  assert.deepStrictEqual(saidas, ['u-1'], `saiu em dobro: ${JSON.stringify(saidas)}`);
+});
+
+teste('🚨 seis pedidos por DOIS caminhos continuam seis etiquetas', async () => {
+  const { fila, lotes } = montar({ duracaoMs: 20 });
+  const seis = ['a', 'b', 'c', 'd', 'e', 'f'];
+  const primeira = fila.enfileirar(job('a'), 9);
+  for (const u of seis.slice(1)) fila.enfileirar(job(u), 9);  // MQTT
+  for (const u of seis) fila.enfileirar(job(u), 9);           // pull, no mesmo instante
+  await primeira;
+  await pausa(60);
+  const saidas = lotes.flatMap((l) => l.uuids);
+  assert.strictEqual(saidas.length, 6, `esperava 6, saíram ${saidas.length}: ${saidas}`);
+  assert.deepStrictEqual([...saidas].sort(), seis);
+});
+
+teste('⚠️ jobs DIFERENTES continuam entrando (a dedupe não pode segurar a fila)', async () => {
+  const { fila, lotes } = montar({ duracaoMs: 10 });
+  const primeira = fila.enfileirar(job('x'), 9);
+  fila.enfileirar(job('y'), 9);
+  fila.enfileirar(job('z'), 9);
+  await primeira;
+  await pausa(40);
+  assert.deepStrictEqual(lotes.flatMap((l) => l.uuids).sort(), ['x', 'y', 'z']);
+});
+
+teste('🚨 depois de IMPRESSO, o mesmo uuid pode voltar (o pull reoferece)', async () => {
+  const { fila, lotes } = montar();
+  await fila.enfileirar(job('u-2'), 9);
+  await pausa(20);
+  await fila.enfileirar(job('u-2'), 9);
+  await pausa(20);
+  assert.strictEqual(
+    lotes.flatMap((l) => l.uuids).length, 2,
+    'a dedupe vale enquanto o job está NA fila, não para sempre',
+  );
+});
+
+teste('🚨 job que FALHOU libera o uuid (preso seria PERDA, pior que duplicata)', async () => {
+  const { fila, lotes } = montar({ falhar: () => true });
+  await fila.enfileirar(job('u-3'), 9);
+  await pausa(20);
+  await fila.enfileirar(job('u-3'), 9);
+  await pausa(20);
+  assert.ok(
+    lotes.flatMap((l) => l.uuids).length >= 2,
+    'depois de falhar, a etiqueta tem de poder voltar',
+  );
+});
+
+for (const [nome, fn] of casos) {
     try {
       await fn();
       passaram++;
