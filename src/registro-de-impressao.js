@@ -60,6 +60,31 @@ const MAXIMO_DE_ENTRADAS = 5000;
 const MAXIMO_DE_TENTATIVAS = 2;
 
 /**
+ * Por quantas horas uma dúvida ainda é dúvida.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * ⚠️ DÚVIDA TEM PRAZO, E ÓRFÃO EM `enviando` NÃO EXPIRAVA (30/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * A poda só removia entrada `confirmado`, e `'enviando'` nasce com
+ * `confirmado: false` — então um job que morreu no meio do envio e nunca
+ * mais foi oferecido pelo Hub ficava no registro **para sempre**: ia em
+ * `?suspeitos=` de todo pull, contava para o teto de entradas e impedia a
+ * própria poda de liberar espaço. Numa máquina instável o arquivo cresce
+ * sem teto e a lista de suspeitos vira lixo que sinaliza o que não é.
+ *
+ * 6 horas é folgado de propósito: o pull do Hub só olha as últimas 2 h
+ * (`JANELA_DE_PENDENTES_H`), então uma dúvida de 6 h já não pode voltar
+ * pelo pull. Passado isso ela não informa mais nada — e marca o papel por
+ * engano se o job reaparecer por outro caminho.
+ *
+ * ⚠️ Podar `'enviando'` NÃO perde notícia para o Hub: `pendentesDeConfirmacao`
+ * nunca manda esse estado como ACK, justamente porque não há desfecho a
+ * contar. A regra "não poda o que não foi confirmado" vale para quem TEM
+ * desfecho e não conseguiu entregá-lo.
+ */
+const HORAS_DE_DUVIDA = 6;
+
+/**
  * Cria o registro.
  *
  * @param {object} portas
@@ -83,10 +108,14 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
 
   function podar() {
     const limite = agora() - HORAS_DE_MEMORIA * 3600000;
+    const limiteDaDuvida = agora() - HORAS_DE_DUVIDA * 3600000;
     for (const [uuid, item] of Object.entries(dados)) {
       // ⚠️ Nunca poda o que ainda não foi confirmado: aquele ACK é a única
       // notícia que o Hub vai receber.
-      if (item.confirmado && item.em < limite) delete dados[uuid];
+      if (item.confirmado && item.em < limite) { delete dados[uuid]; continue; }
+      // ⚠️ Exceção: `'enviando'` velho. Ele não tem ACK a entregar (ver
+      // `HORAS_DE_DUVIDA`) e, sem isto, nunca saía do registro.
+      if (item.estado === 'enviando' && item.em < limiteDaDuvida) delete dados[uuid];
     }
     const chaves = Object.keys(dados);
     if (chaves.length > MAXIMO_DE_ENTRADAS) {
@@ -233,6 +262,46 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
         .map(([job_uuid, item]) => ({ job_uuid, status: item.status, error: item.erro }));
     },
 
+    /**
+     * Os jobs em `'enviando'`: fomos ao papel e nunca soubemos o desfecho.
+     *
+     * ══════════════════════════════════════════════════════════════════════
+     * 🚨 ESTA É A ÚNICA DÚVIDA REAL, E É O HUB QUE PRECISA SABER (30/10/2026)
+     * ══════════════════════════════════════════════════════════════════════
+     * O pull do Hub carimbava `REIMPRESSAO` em tudo que ele reentregava,
+     * porque do lado dele a única informação é "entreguei e não recebi ACK".
+     * Medido em dois ensaios de queda com identidade por etiqueta: das 19
+     * recuperadas em cada leva, **19 eram inéditas** — 38 etiquetas marcadas
+     * como 2ª via sem nunca ter saído. E quem lê "REIMPRESSAO" **descarta**:
+     * é perda de trabalho silenciosa, pior que a duplicata que a marca
+     * tentava evitar.
+     *
+     * Quem sabe é este registro. Três situações, e só uma é dúvida:
+     *   sem entrada        nunca vimos o job        ⇒ inédita
+     *   `'impresso'`       saiu                     ⇒ nem reimprime
+     *   `'enviando'`       morreu ENTRE o envio e
+     *                      o registro do desfecho  ⇒ PODE ter saído
+     *
+     * O pull manda esta lista, e só ela recebe marca no papel. Na prática
+     * são 1 a 3 itens: `'enviando'` só sobrevive a um desastre.
+     *
+     * ⚠️ Ordenado do mais recente para o mais antigo e com teto: a lista vai
+     * na URL do pull, e o servidor descarta lista absurda INTEIRA (ver
+     * `rotulo-da-recuperacao.ts` no backend). Mandar os mais recentes é o
+     * que preserva a marca justamente no job da queda que acabou de
+     * acontecer.
+     */
+    emEnviando(maximo = 20) {
+      const limite = agora() - HORAS_DE_DUVIDA * 3600000;
+      return Object.entries(dados)
+        // ⚠️ Dúvida vencida não é dúvida: ver `HORAS_DE_DUVIDA`. Sem este
+        // recorte, órfão antigo marcaria papel por engano.
+        .filter(([, item]) => item.estado === 'enviando' && (item.em || 0) >= limite)
+        .sort((a, b) => (b[1].em || 0) - (a[1].em || 0))
+        .slice(0, maximo)
+        .map(([job_uuid]) => job_uuid);
+    },
+
     /** Grava em disco (com poda). Chamado UMA vez por lote, não por etiqueta. */
     salvar,
 
@@ -243,6 +312,7 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
 
 module.exports = {
   criarRegistroDeImpressao,
+  HORAS_DE_DUVIDA,
   HORAS_DE_MEMORIA,
   MAXIMO_DE_ENTRADAS,
   MAXIMO_DE_TENTATIVAS,
