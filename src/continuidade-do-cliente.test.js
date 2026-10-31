@@ -469,8 +469,19 @@ teste('⚠️ enquanto ocupado, REAVALIA — não desiste na primeira tentativa'
 });
 
 teste('🚨 o registro é GRAVADO antes de reiniciar', () => {
-  const i = main.indexOf('registroDeImpressao.salvar()\n  if (autoUpdater) autoUpdater.quitAndInstall');
-  assert.ok(i > 0, 'reiniciar sem gravar perde a prova de que o papel saiu');
+  /*
+   * ⚠️ Comparado por POSIÇÃO dentro da função, nunca por uma string que
+   * contenha quebra de linha: no Windows o checkout usa CRLF e um `\n`
+   * literal não casa. Este caso quebrou o build 41210279717 — verde no Mac,
+   * vermelho no runner Windows, e o instalador não saiu.
+   */
+  const k = main.indexOf('async function avaliarReinicio');
+  assert.ok(k > 0, 'não achei a função de reinício');
+  const trecho = main.slice(k, k + 2000);
+  const i = trecho.indexOf('registroDeImpressao.salvar()');
+  const j = trecho.indexOf('quitAndInstall');
+  assert.ok(i > 0 && j > 0, 'não achei as duas pontas');
+  assert.ok(i < j, 'reiniciar sem gravar perde a prova de que o papel saiu');
 });
 
 for (const [nome, fn] of casos) {
