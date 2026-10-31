@@ -405,13 +405,15 @@ const registroDeImpressao = criarRegistroDeImpressao({
 
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
 const { scriptPowerShell, comandoPowerShell, argumentosPowerShell, tetoDoEnvioRaw } = require('./src/envio-raw-windows')
-const { criarPreparoDeImpressora, comandoDesligarBidi } = require('./src/preparo-impressora')
+const { criarPreparoDeImpressora, comandoDesligarBidi, colarNaEtiqueta } = require('./src/preparo-impressora')
 const {
   canalDePdf,
   canalDeZpl,
   argumentosDePdf,
   argumentosDeZplRaw,
   interpretarLpstat,
+  argumentosDeEstadoDaFila,
+  filaEstaPausada,
 } = require('./src/impressao-cups')
 
 /**
@@ -493,19 +495,68 @@ const filaDeImpressao = criarFilaDeImpressao({
     // ⚠️ `linguagem` vem do JOB: num lote ZPL a impressora já trocou de modo
     // ao ver o `^XA`, e o comando certo é o `~JSO`, mesmo que o driver
     // instalado no Windows seja o EPL.
-    await preparoDeImpressora.preparar(job.printer_system_name, {
+    const opcoesDePreparo = {
       ...obterPreparo(job.printer_system_name),
       ...(job.type === 'zpl' ? { linguagem: 'zpl' } : {}),
       // Mesmo destino do job: socket quando a Zebra tem IP, spooler quando não.
       zplHost: job.zpl_host || null,
       zplPort: job.zpl_port || null,
-    })
+    }
+
+    /*
+     * ══════════════════════════════════════════════════════════════════════
+     * 🚨 O PREPARO VAI COLADO NA ETIQUETA, NÃO NUMA CHAMADA PRÓPRIA
+     * ══════════════════════════════════════════════════════════════════════
+     * Medido no `print.log` da RDF em 31/10/2026 (16 filas instaladas):
+     *   os 5 bytes do `~JSA` sozinhos .... 16.182 ms
+     *   41 KB (1 etiqueta) .............. 2.425 ms
+     *   335 KB (9 etiquetas) ............ 2.687 ms
+     * O custo é ABRIR a impressora no spooler, não o volume. Duas chamadas
+     * custavam duas aberturas; colado, abre uma — e some o maior pedaço dos
+     * 31 s que a primeira etiqueta de cada lote levava naquela máquina.
+     *
+     * ⚠️ `comandoColado` devolve `null` em tudo que não for seguro colar
+     * (PDF, impressora que não fala ZPL, linguagem do job diferente da do
+     * driver, preparo recente). Nesses casos o caminho ANTIGO roda igual, e
+     * o comportamento é o de hoje — é o que garante que nada piora onde já
+     * estava bom.
+     *
+     * ⚠️ O preparo só é CONTADO depois do envio dar certo: se a etiqueta
+     * falhar, a impressora não recebeu o comando e a próxima tem de tentar
+     * de novo.
+     */
+    const colado =
+      job.type === 'zpl'
+        ? preparoDeImpressora.comandoColado(job.printer_system_name, opcoesDePreparo)
+        : null
+    if (!colado) await preparoDeImpressora.preparar(job.printer_system_name, opcoesDePreparo)
+
     if (job.type === 'zpl') {
       // ⚠️ ZPL é um fluxo de comandos (`^XA`…`^XZ` por etiqueta): concatenar
       // é o formato nativo de mandar várias. Um socket, não N.
-      await imprimirZpl(Buffer.concat(buffers), job.zpl_host, job.zpl_port || 9100, job.printer_system_name, buffers.length)
+      const corpo = Buffer.concat(buffers)
+      const comPreparo = colarNaEtiqueta(colado && colado.texto, corpo)
+      await imprimirZpl(comPreparo, job.zpl_host, job.zpl_port || 9100, job.printer_system_name, buffers.length)
+      if (colado) {
+        preparoDeImpressora.confirmarPreparo(colado.chave)
+        registrar(`[preparo] ${job.printer_system_name}: comando foi COLADO na etiqueta (uma abertura só)`)
+      }
     } else {
       await imprimirPdf(buffers, job.printer_system_name, job.escala)
+    }
+
+    /*
+     * ⚠️ O BIDIRECIONAL SAI DO CAMINHO CRÍTICO (31/10/2026).
+     * Medido na RDF: 11.610 ms de consulta WMI ANTES da primeira etiqueta.
+     * Ele é otimização para as etiquetas SEGUINTES (tira a pausa entre
+     * elas), então esperar por ele antes do papel começar a sair é pagar o
+     * custo na hora errada. Agora roda depois, e sem `await`.
+     *
+     * ⚠️ `void` + `.catch` de propósito: falha aqui nunca pode derrubar uma
+     * impressão que já deu certo — era assim antes e continua.
+     */
+    if (colado && preparoDeImpressora.desligarBidiDepois) {
+      void preparoDeImpressora.desligarBidiDepois(job.printer_system_name, opcoesDePreparo)
     }
   },
   /**
@@ -951,11 +1002,10 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
     } else {
       // macOS/Linux: CUPS. O nome da fila vai como argumento, nunca dentro
       // de uma string de shell — aspas no nome quebrariam o comando.
-      entregarAoCups(argumentosDePdf({
-        impressora: printerName,
-        arquivo: file,
-        escala: escalaSumatra,
-      }))
+      entregarAoCups(
+        argumentosDePdf({ impressora: printerName, arquivo: file, escala: escalaSumatra }),
+        printerName,
+      )
     }
     /*
      * ⚠️ Este número é o que separa "o software está lento" de "a
@@ -969,13 +1019,52 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
   }
 }
 
-function entregarAoCups (args) {
+function entregarAoCups (args, impressora = null) {
   const { execFileSync } = require('child_process')
   try {
     execFileSync('lp', args, { timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] })
   } catch (e) {
     const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
     throw new Error(`CUPS recusou o trabalho (${args.join(' ')}): ${detalhe.slice(0, 300)}`)
+  }
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   * 🚨 "ACEITO" NÃO É "VAI SAIR": A FILA PODE ESTAR PAUSADA (31/10/2026)
+   * ══════════════════════════════════════════════════════════════════════
+   * O `lp` enfileira e volta na hora, e o ACK era dado sobre isso. Caso real
+   * medido no Hub: 5 ondas de 21 etiquetas, todas `success` com ACK em
+   * 0-1 s, e nenhuma saiu — a fila do CUPS estava pausada. O macOS pausa a
+   * fila inteira quando um trabalho falha no backend, e tudo que chega
+   * depois espera, inclusive etiqueta boa. O Hub mostrava verde enquanto a
+   * operadora olhava a impressora parada; só um clique em "retomar" liberou.
+   *
+   * Conferir o estado DEPOIS de entregar transforma isso em erro visível: a
+   * etiqueta aparece na tela como não confirmada e alguém age, em vez de
+   * alguém descobrir contando papel.
+   *
+   * ⚠️ **Falha ABERTA.** Se o `lpstat` não rodar, demorar ou devolver frase
+   * que não reconhecemos, não se acusa nada — o comportamento volta a ser o
+   * de hoje. "Não sei" nunca pode virar pendência para o operador.
+   */
+  if (!impressora) return
+  let pausada = false
+  try {
+    const saida = execFileSync('lpstat', argumentosDeEstadoDaFila(impressora), {
+      timeout: 8000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    pausada = filaEstaPausada(saida.toString())
+  } catch (_) {
+    // Falha do próprio `lpstat` não acusa nada (falha ABERTA).
+    return
+  }
+  if (pausada) {
+    registrar(`[cups] ${impressora}: a FILA ESTÁ PAUSADA — o trabalho entrou mas não vai sair`)
+    throw new Error(
+      `A fila de impressão "${impressora}" está pausada no sistema: o trabalho foi aceito ` +
+        'mas não será impresso. Retome a impressora e mande de novo.',
+    )
   }
 }
 
@@ -1208,7 +1297,7 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1
     const file = path.join(os.tmpdir(), `mhub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.zpl`)
     fs.writeFileSync(file, buffer)
     try {
-      entregarAoCups(argumentosDeZplRaw({ impressora: printerName, arquivo: file }))
+      entregarAoCups(argumentosDeZplRaw({ impressora: printerName, arquivo: file }), printerName)
     } finally {
       try { fs.unlinkSync(file) } catch (_) {}
     }

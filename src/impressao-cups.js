@@ -61,8 +61,57 @@ function interpretarLpstat (saida) {
   return nomes
 }
 
+/**
+ * Argumentos do `lpstat` para perguntar o estado de UMA fila.
+ *
+ * ⚠️ `-p <fila>` e não `-p` sozinho: numa máquina com 16 filas, perguntar por
+ * todas custa segundos e ainda traz o estado de quem não interessa.
+ */
+function argumentosDeEstadoDaFila (impressora) {
+  return ['-p', impressora]
+}
+
+/**
+ * A fila está PAUSADA? (o `lp` aceitou, mas nada vai sair)
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 O ACK DIZIA SUCESSO COM 5 LOTES PARADOS NA FILA (31/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * Caso real, medido no Hub: a operadora de um Mac mandou a mesma onda de 21
+ * etiquetas CINCO vezes porque nada saía. Do lado do Hub, as 5 estavam
+ * `success` com ACK em 0-1 s — porque o `lp` ENFILEIRA e volta na hora, e o
+ * ACK foi dado sobre isso. A fila do CUPS estava pausada, e o macOS pausa a
+ * fila inteira quando um trabalho falha no backend: tudo que chega depois
+ * espera, inclusive etiqueta boa. Só um clique em "retomar" liberou.
+ *
+ * Enquanto isso o Hub mostrava tudo verde e ela olhava a impressora parada.
+ * É a mesma classe de defeito que este projeto passou dois dias caçando —
+ * perda que não aparece em lugar nenhum — só num lugar que ninguém tinha
+ * olhado: DEPOIS da entrega.
+ *
+ * ⚠️ A frase é TRADUZIDA: num Mac em português a linha é
+ * `impressora X desativada desde ...`; em inglês, `printer X disabled
+ * since ...`. Medido no `lpstat -p` deste Mac:
+ *   impressora HP_Color_LaserJet_Pro_4203 está ociosa.  ativada desde ...
+ *   impressora HP_LaserJet_Professional_P_1102w desativada desde ... -
+ *
+ * ⚠️ `\b` em volta de `desativada` é o que impede casar com `ativada`, que
+ * aparece justamente na linha de quem está SAUDÁVEL.
+ *
+ * ⚠️ **Falha ABERTA**: saída vazia, erro do `lpstat` ou frase que não
+ * reconhecemos devolvem `false`. Marcar erro por não entender a saída faria
+ * etiqueta boa virar pendência — e o estado "não sei" nunca deve acusar.
+ */
+function filaEstaPausada (saidaDoLpstat) {
+  const texto = String(saidaDoLpstat || '')
+  if (!texto.trim()) return false
+  return /\bdesativada\b/i.test(texto) || /\bdisabled\b/i.test(texto)
+}
+
 module.exports = {
   canalDePdf,
+  argumentosDeEstadoDaFila,
+  filaEstaPausada,
   canalDeZpl,
   argumentosDePdf,
   argumentosDeZplRaw,

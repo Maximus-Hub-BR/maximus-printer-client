@@ -13,6 +13,8 @@ const {
   comandosDePreparo,
   ehZebra,
   linguagemDaImpressora,
+  INTERVALO_MS,
+  colarNaEtiqueta,
 } = require('./preparo-impressora');
 
 let passaram = 0;
@@ -301,7 +303,203 @@ function describe_bloco(nome, fn) {
 }
 
 (async () => {
-  for (const [nome, fn] of casos) {
+  /*
+ * ══════════════════════════════════════════════════════════════════════════
+ * O COMANDO COLADO NA ETIQUETA — o que economiza 16 s na RDF
+ * ══════════════════════════════════════════════════════════════════════════
+ * Medido em 31/10/2026: mandar os 5 bytes do preparo sozinho custou 16.182 ms
+ * naquela máquina, e 335 KB custaram 2.687 ms. O custo é ABRIR a impressora
+ * no spooler, não o volume — então o comando vai colado e abre uma vez só.
+ *
+ * ⚠️ Estes casos não substituem os do `preparar()`: o caminho antigo continua
+ * existindo e testado, para PDF e para quando a linguagem não casa.
+ */
+
+teste('🚨 comandoColado devolve o ~JSA quando o job é ZPL numa Zebra', () => {
+  const { preparo } = montar();
+  const c = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  assert.ok(c, 'devia ter comando a colar');
+  assert.ok(c.texto.includes('~JSA'), `texto inesperado: ${JSON.stringify(c.texto)}`);
+  assert.ok(c.chave, 'a chave é o que permite confirmar depois');
+});
+
+teste('🚨 NÃO cola quando a linguagem do job difere da da impressora', () => {
+  // Zebra cujo driver anuncia EPL, recebendo job ZPL: o `JB` não vale em modo
+  // ZPL e o `~JSA` não vale em EPL. Colar o comando errado é pior que nada.
+  const { preparo } = montar();
+  assert.strictEqual(preparo.comandoColado('ZDesigner GC420t (EPL)', { linguagem: 'zpl' }), null);
+});
+
+teste('⚠️ NÃO cola sem a linguagem do JOB declarada', () => {
+  // Sem ela não se sabe em que modo a impressora vai LER os bytes colados.
+  const { preparo } = montar();
+  assert.strictEqual(preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', {}), null);
+});
+
+teste('comandoColado respeita a lista de ACEITE (não é Zebra, não cola)', () => {
+  const { preparo } = montar();
+  assert.strictEqual(preparo.comandoColado('TOMATE_MDK_008', { linguagem: 'zpl' }), null);
+  assert.strictEqual(preparo.comandoColado('Microsoft Print to PDF', { linguagem: 'zpl' }), null);
+});
+
+teste('comandoColado respeita `ligado: false`', () => {
+  const { preparo } = montar();
+  assert.strictEqual(
+    preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl', ligado: false }),
+    null,
+  );
+});
+
+teste('🚨 comandoColado NÃO marca por si: sem confirmar, ele insiste', () => {
+  /*
+   * Se marcasse na hora, um envio que FALHOU contaria como preparo feito e a
+   * impressora ficaria uma hora sem o comando — trocando 16 s de economia
+   * pela pausa entre etiquetas, que é a queixa de origem.
+   */
+  const { preparo } = montar();
+  const a = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  const b = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  assert.ok(a && b, 'enquanto ninguém confirma, ele continua pedindo');
+});
+
+teste('🚨 depois de confirmar, não cola de novo dentro do intervalo', () => {
+  const { preparo } = montar();
+  const c = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  preparo.confirmarPreparo(c.chave);
+  assert.strictEqual(preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' }), null);
+});
+
+teste('⚠️ passado o intervalo, volta a colar (cobre reset de fábrica)', () => {
+  let t = 0;
+  const { preparo } = montar({ agora: () => t });
+  const c = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  preparo.confirmarPreparo(c.chave);
+  t += INTERVALO_MS + 1;
+  assert.ok(preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' }));
+});
+
+teste('⚠️ o preparo COLADO e o preparo por envio compartilham a memória', () => {
+  // Senão a impressora receberia o comando duas vezes, por dois caminhos.
+  const { preparo } = montar();
+  const c = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  preparo.confirmarPreparo(c.chave);
+  return preparo
+    .preparar('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' })
+    .then((r) => assert.strictEqual(r, 'recente', `esperava 'recente', veio '${r}'`));
+});
+
+teste('🚨 o texto colado é EXATAMENTE o mesmo do caminho antigo', () => {
+  // A economia é no número de aberturas do spooler, não no comando: se o
+  // conteúdo divergir, a impressora passa a ser configurada de outra forma.
+  const { preparo, enviados } = montar();
+  const c = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  return preparo
+    .preparar('ZDesigner 105SL 203DPI', { linguagem: 'zpl' })
+    .then(() => {
+      assert.ok(enviados.length, 'o caminho antigo não enviou nada');
+      assert.strictEqual(c.texto, enviados[enviados.length - 1].texto);
+    });
+});
+
+/*
+ * O BIDIRECIONAL FORA DO CAMINHO CRÍTICO — 11,6 s que a etiqueta pagava
+ */
+
+teste('🚨 desligarBidiDepois roda o WMI e NÃO lança', async () => {
+  const { preparo, bidis } = montar();
+  const r = await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  assert.strictEqual(r, 'ok');
+  assert.deepStrictEqual(bidis, ['ZDesigner ZD220-203dpi ZPL'], 'o bidi TEM de rodar — só não antes');
+});
+
+teste('🚨 falha no bidi NÃO derruba nada (impressão já deu certo)', async () => {
+  const { preparo } = montar({ bidiFalha: true });
+  const r = await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  assert.strictEqual(r, 'falhou', 'devolve o estado, nunca lança');
+});
+
+teste('⚠️ falha NÃO marca: a próxima impressão tenta de novo', async () => {
+  const { preparo, bidis } = montar({ bidiFalha: true });
+  await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  assert.strictEqual(bidis.length, 0, 'as duas falharam, e as duas tentaram');
+});
+
+teste('não repete dentro do intervalo (WMI é caro: 11,6 s na RDF)', async () => {
+  const { preparo, bidis } = montar();
+  await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  const r = await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  assert.strictEqual(r, 'recente');
+  assert.strictEqual(bidis.length, 1);
+});
+
+teste('🚨 a memória do bidi é SEPARADA da do preparo', async () => {
+  /*
+   * Se compartilhassem, o comando indo COLADO marcaria a chave e o bidi
+   * nunca mais rodaria — e a pausa entre etiquetas (a queixa de origem da
+   * RDF) voltaria em silêncio.
+   */
+  const { preparo, bidis } = montar();
+  const c = preparo.comandoColado('ZDesigner ZD220-203dpi ZPL', { linguagem: 'zpl' });
+  preparo.confirmarPreparo(c.chave);
+  const r = await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {});
+  assert.strictEqual(r, 'ok', 'o preparo colado não pode cancelar o bidi');
+  assert.strictEqual(bidis.length, 1);
+});
+
+teste('respeita `bidi: false` e a lista de aceite', async () => {
+  const { preparo, bidis } = montar();
+  assert.strictEqual(await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', { bidi: false }), 'desligado');
+  assert.strictEqual(await preparo.desligarBidiDepois('TOMATE_MDK_008', {}), 'nao_e_zebra');
+  assert.strictEqual(bidis.length, 0);
+});
+
+teste('sem a porta desligarBidi, não quebra', async () => {
+  const { preparo } = montar({ semBidi: true });
+  assert.strictEqual(await preparo.desligarBidiDepois('ZDesigner ZD220-203dpi ZPL', {}), 'desligado');
+});
+
+/*
+ * A COLAGEM, medida por BYTES — o caso que faltava
+ * ⚠️ Removê-la do main.js passou pelos 29 casos estruturais sem um vermelho.
+ */
+
+teste('🚨 sem preparo, o corpo da etiqueta sai INTACTO (byte a byte)', () => {
+  const corpo = Buffer.from('^XA^FO50,50^FDTESTE^FS^XZ\n', 'ascii');
+  const r = colarNaEtiqueta(null, corpo);
+  assert.strictEqual(r.equals(corpo), true, 'sem preparo nada pode mudar na etiqueta');
+  assert.strictEqual(colarNaEtiqueta(undefined, corpo).equals(corpo), true);
+  assert.strictEqual(colarNaEtiqueta('', corpo).equals(corpo), true);
+});
+
+teste('🚨 com preparo, o comando vem ANTES e o corpo continua intacto', () => {
+  const corpo = Buffer.from('^XA^FO50,50^FDTESTE^FS^XZ\n', 'ascii');
+  const r = colarNaEtiqueta('~JSA\n', corpo);
+  const texto = r.toString('ascii');
+  assert.ok(texto.startsWith('~JSA\n'), `não começa com o preparo: ${JSON.stringify(texto.slice(0, 12))}`);
+  // O corpo tem de sobreviver byte a byte depois do prefixo.
+  assert.strictEqual(r.subarray(Buffer.byteLength('~JSA\n')).equals(corpo), true);
+  // E o ^XA original não pode ter sido tocado.
+  assert.strictEqual((texto.match(/\^XA/g) || []).length, 1);
+});
+
+teste('⚠️ o preparo vem antes do PRIMEIRO ^XA, nunca no meio do lote', () => {
+  // Comando de configuração depois de um formato aberto é lido como dado.
+  const lote = Buffer.concat([
+    Buffer.from('^XA^FDA^FS^XZ\n', 'ascii'),
+    Buffer.from('^XA^FDB^FS^XZ\n', 'ascii'),
+  ]);
+  const texto = colarNaEtiqueta('~JSA\n', lote).toString('ascii');
+  assert.ok(texto.indexOf('~JSA') < texto.indexOf('^XA'), 'o preparo tem de preceder o primeiro formato');
+  assert.strictEqual((texto.match(/~JSA/g) || []).length, 1, 'uma vez só, não por etiqueta');
+});
+
+teste('⚠️ a colagem é ASCII puro (byte estranho vira caractere de controle)', () => {
+  const r = colarNaEtiqueta('~JSA\n', Buffer.from('^XA^XZ', 'ascii'));
+  for (const b of r) assert.ok(b >= 0x09 && b <= 0x7e, `byte fora do ASCII imprimível: ${b}`);
+});
+
+for (const [nome, fn] of casos) {
     if (!fn) { console.log(`  ${nome}`); continue; }
     try {
       await fn();

@@ -330,6 +330,93 @@ teste('⚠️ o require de decisao-do-job vem ANTES do uso (TDZ não aparece no 
   assert.ok(req < uso, 'o require ficou DEPOIS do uso: ReferenceError em produção');
 });
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * A VELOCIDADE: o preparo colado e o bidi fora do caminho (31/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * Medido no print.log da RDF: 5 bytes de preparo custaram 16.182 ms e a
+ * consulta do bidirecional 11.610 ms, as duas ANTES da primeira etiqueta —
+ * 27,8 s de preparação para 5,1 s de impressão.
+ *
+ * ⚠️ O EFEITO (o corpo da etiqueta sai intacto, o comando vem antes) é
+ * provado por BYTES em `preparo-impressora.test.js`. Aqui só se garante que
+ * o main.js continua ligando as peças: se ele parar de colar ou voltar a
+ * esperar pelo bidi, a lentidão volta sem nenhum teste reclamar.
+ */
+
+teste('🚨 o lote ZPL pede o comando COLADO antes de montar o buffer', () => {
+  assert.ok(
+    /job\.type === 'zpl'[\s\S]{0,200}preparoDeImpressora\.comandoColado\(/.test(main),
+    'o caminho ZPL parou de pedir o comando colado — volta a abrir o spooler 2x',
+  );
+});
+
+teste('🚨 o buffer enviado PASSA pela colagem (a prova de bytes está no módulo)', () => {
+  assert.ok(
+    main.includes('colarNaEtiqueta(colado && colado.texto, corpo)'),
+    'o preparo deixou de entrar no buffer da etiqueta',
+  );
+  assert.ok(
+    /imprimirZpl\(comPreparo,/.test(main),
+    'o buffer com o preparo não é o que vai para a impressora',
+  );
+});
+
+teste('⚠️ o caminho ANTIGO continua como rede quando não dá para colar', () => {
+  // PDF, impressora que não fala ZPL, linguagem divergente, preparo recente:
+  // nesses casos o comportamento tem de ser exatamente o de hoje.
+  assert.ok(
+    /if \(!colado\) await preparoDeImpressora\.preparar\(/.test(main),
+    'sem a rede, quem não pode colar deixa de ser preparado',
+  );
+});
+
+teste('🚨 o preparo só é CONFIRMADO depois do envio dar certo', () => {
+  // Confirmar antes faria um envio que falhou contar como preparo feito, e a
+  // impressora ficaria uma hora sem o comando — trocando a economia pela
+  // pausa entre etiquetas, que é a queixa de origem.
+  const i = main.indexOf('imprimirZpl(comPreparo,');
+  const j = main.indexOf('confirmarPreparo(colado.chave)');
+  assert.ok(i > 0 && j > 0, 'não achei as duas pontas');
+  assert.ok(i < j, 'o confirmar está ANTES do envio');
+});
+
+teste('🚨 o bidirecional NÃO é esperado (void), e roda DEPOIS da etiqueta', () => {
+  const i = main.indexOf('imprimirZpl(comPreparo,');
+  const j = main.indexOf('desligarBidiDepois(');
+  assert.ok(i > 0 && j > 0, 'não achei as duas pontas');
+  assert.ok(i < j, 'o bidi voltou para antes da impressão (11,6 s na RDF)');
+  assert.ok(
+    /void preparoDeImpressora\.desligarBidiDepois\(/.test(main),
+    'o bidi voltou a ser esperado — a etiqueta paga o WMI de novo',
+  );
+});
+
+teste('🚨 o CUPS confere a fila DEPOIS de entregar (o ACK que mentia)', () => {
+  // 5 ondas `success` com a fila pausada e nenhuma etiqueta no papel.
+  assert.ok(
+    main.includes('filaEstaPausada(saida.toString())'),
+    'o cliente voltou a confiar no "aceito" do lp',
+  );
+  assert.ok(
+    /está pausada no sistema/.test(main),
+    'sem a mensagem, o operador não sabe que precisa retomar a impressora',
+  );
+});
+
+teste('⚠️ os DOIS caminhos do CUPS informam a impressora (senão não há o que conferir)', () => {
+  assert.ok(/argumentosDePdf\([\s\S]{0,160}\n\s*printerName,/.test(main), 'o caminho PDF não informa a fila');
+  assert.ok(/argumentosDeZplRaw\([^)]*\}\), printerName\)/.test(main), 'o caminho ZPL não informa a fila');
+});
+
+teste('🚨 a conferência da fila falha ABERTA (lpstat ruim não acusa nada)', () => {
+  // Marcar erro por não entender a saída faria etiqueta boa virar pendência.
+  const i = main.indexOf("execFileSync('lpstat'");
+  assert.ok(i > 0, 'não achei a consulta');
+  const trecho = main.slice(i, i + 400);
+  assert.ok(/catch \(_\) \{[\s\S]{0,160}return/.test(trecho), 'falha do lpstat tem de voltar sem acusar');
+});
+
 for (const [nome, fn] of casos) {
   try { fn(); passaram++; console.log(`  ✓ ${nome}`); }
   catch (erro) { console.error(`  ✗ ${nome}\n    ${erro.message}`); process.exitCode = 1; }
