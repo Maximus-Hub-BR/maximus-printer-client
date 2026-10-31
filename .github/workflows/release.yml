@@ -68,6 +68,39 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npx electron-builder --win --x64 --publish always
 
+      # 🚨 A CÓPIA DE NOME FIXO, SEM A VERSÃO (31/10/2026)
+      #
+      # O `artifactName` do package.json põe a versão no nome
+      # (`MHubPrintClient-Setup-1.0.22.exe`), então o endereço de download
+      # muda a cada release. A página pública serve
+      # `maximushub.com.br/print-client.exe` por um 302 para
+      # `releases/latest/download/MHubPrintClient-Setup.exe` — nome FIXO, que
+      # é a única forma de o link na mão de alguém continuar valendo.
+      #
+      # Até aqui essa cópia era subida À MÃO, e por isso existia só na
+      # 1.0.21: publicar a 1.0.22 moveu o `latest` e os dois links públicos
+      # passaram a dar **404**, sem nada avisar — quem clicou naquela janela
+      # recebeu a página de erro do GitHub. Erro medido em 31/10/2026, nove
+      # minutos depois de eu afirmar que os links estavam no ar.
+      #
+      # ⚠️ É CÓPIA, não renomeação: o `latest.yml` que o `electron-updater`
+      # consulta aponta para o nome COM versão, e remover aquele arquivo
+      # pararia o auto-update de todo o parque Windows.
+      - name: Publicar a cópia de nome fixo (o link público)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          origem="dist/MHubPrintClient-Setup-${{ inputs.versao }}.exe"
+          if [ ! -f "$origem" ]; then
+            echo "não achei $origem"; ls -la dist || true; exit 1
+          fi
+          cp "$origem" dist/MHubPrintClient-Setup.exe
+          gh release upload "v${{ inputs.versao }}" \
+            dist/MHubPrintClient-Setup.exe --clobber
+          echo "cópia de nome fixo publicada em v${{ inputs.versao }}"
+
   mac:
     runs-on: macos-latest
     needs: windows
