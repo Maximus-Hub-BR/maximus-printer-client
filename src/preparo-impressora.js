@@ -233,13 +233,28 @@ function criarPreparoDeImpressora({
        *
        * Quem manda o preparo tem de mandá-lo pelo mesmo caminho do job.
        */
+      /*
+       * ⚠️ CRONOMETRADO (31/10/2026). Medido no Hub: na RDF
+       * (LAPTOP-KO8NI12G, 16 filas instaladas) a PRIMEIRA etiqueta de um
+       * lote levou 58 s até o ACK e as 8 seguintes saíram em 9 s. Nas
+       * outras máquinas (7 filas) a primeira leva 0,6 a 1,3 s.
+       *
+       * Havia duas etapas em sequência aqui e NENHUMA registrava tempo —
+       * então não havia como dizer se o minuto era o comando ZPL, a
+       * consulta WMI do bidirecional, ou a impressora acordando. Sem o
+       * número, a correção seria palpite; e palpite já custou duas
+       * releases neste repositório.
+       */
+      const tEnvio = agora();
       await enviarZpl(nomeDaImpressora, comandosDePreparo({ ...opcoes, linguagem }), {
         zplHost: opcoes.zplHost || null,
         zplPort: opcoes.zplPort || null,
       });
+      const msEnvio = agora() - tEnvio;
       ultimoPreparo.set(chave, agora());
       registrar(
-        `impressora ${nomeDaImpressora} preparada em ${linguagem.toUpperCase()} (backfeed desligado)`,
+        `impressora ${nomeDaImpressora} preparada em ${linguagem.toUpperCase()} ` +
+          `(backfeed desligado) — comando levou ${msEnvio} ms`,
       );
       /*
        * ⚠️ DEPOIS do comando, e com erro isolado: desligar o bidirecional é a
@@ -247,12 +262,16 @@ function criarPreparoDeImpressora({
        * exigir elevação. Falhar aqui não pode apagar o preparo que deu certo.
        */
       if (desligarBidi && opcoes.bidi !== false) {
+        const tBidi = agora();
         try {
-          registrar(`${nomeDaImpressora}: ${await desligarBidi(nomeDaImpressora)}`);
+          const r = await desligarBidi(nomeDaImpressora);
+          registrar(`${nomeDaImpressora}: ${r} — bidirecional levou ${agora() - tBidi} ms`);
         } catch (erro) {
+          // ⚠️ O tempo entra no log do ERRO também: timeout de 15 s é o
+          // sintoma que distingue "WMI travado" de "WMI que respondeu não".
           registrar(
             `${nomeDaImpressora}: nao foi possivel desligar o bidirecional ` +
-              `(${erro && erro.message ? erro.message : erro})`,
+              `em ${agora() - tBidi} ms (${erro && erro.message ? erro.message : erro})`,
           );
         }
       }
