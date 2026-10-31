@@ -73,10 +73,53 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
   /** chave do destino → { pendentes: [], rodando: boolean } */
   const filas = new Map();
 
+  /**
+   * Enfileira — recusando o `job_uuid` que JÁ está na fila.
+   *
+   * ══════════════════════════════════════════════════════════════════════════
+   * 🚨 11 ETIQUETAS PARA 6 PEDIDOS (31/10/2026)
+   * ══════════════════════════════════════════════════════════════════════════
+   * Medido no `print.log` da RDF:
+   *
+   *   13:52:47 [pull] 6 pendente(s): 5 para imprimir, 1 em DÚVIDA
+   *   13:53:06 [zpl] 11 etiqueta(s), 412 KB
+   *   13:53:06 [fila] lote de 11 etiqueta(s) em UMA chamada
+   *   e 11 ACKs para 6 uuids — cinco repetidos.
+   *
+   * O MESMO job chegou por DOIS caminhos quase no mesmo instante: o MQTT
+   * publicou as 6 e o pull entregou as mesmas 6 (o pull oferece tudo que
+   * está sem ACK, e naquele segundo nenhuma tinha ACK ainda). As duas
+   * cópias entraram, e o papel saiu em dobro.
+   *
+   * ⚠️ O registro em disco NÃO barra isto: ele só marca quando a impressão
+   * COMEÇA, e aqui as duas cópias entram antes disso. O cabeçalho do
+   * `puxarPendentes` já descrevia a janela — *"duas listas iguais em voo
+   * enfileirariam o mesmo job duas vezes antes de qualquer impressão"* — e
+   * ela ficou latente até alguém medir o papel.
+   *
+   * ⚠️ Deduplicar por `job_uuid` NÃO atrapalha reimpressão: quando o
+   * operador manda imprimir de novo, o Hub cria um job NOVO, com uuid novo.
+   * O que se barra aqui é a MESMA entrega chegando duas vezes.
+   *
+   * ⚠️ O uuid sai do conjunto quando o item tem desfecho (no `despachar`),
+   * não quando entra no lote — senão a janela voltaria a existir entre o
+   * `splice` e a impressão.
+   */
   function enfileirar(job, userId) {
     const chave = chaveDoDestino(job);
-    if (!filas.has(chave)) filas.set(chave, { pendentes: [], rodando: false });
-    filas.get(chave).pendentes.push({ job, userId });
+    if (!filas.has(chave)) filas.set(chave, { pendentes: [], rodando: false, emCurso: new Set() });
+    const fila = filas.get(chave);
+    if (!fila.emCurso) fila.emCurso = new Set();
+
+    const uuid = job && job.job_uuid;
+    if (uuid) {
+      if (fila.emCurso.has(uuid)) {
+        registrar(`${uuid} já está na fila — ignorando a segunda entrega (MQTT + pull)`);
+        return;
+      }
+      fila.emCurso.add(uuid);
+    }
+    fila.pendentes.push({ job, userId });
     return bombear(chave);
   }
 
@@ -102,16 +145,34 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
     }
   }
 
+  /** O uuid deixa de ocupar a fila quando o item TEM desfecho. */
+  function liberar(lote) {
+    for (const fila of filas.values()) {
+      if (!fila.emCurso) continue;
+      for (const item of lote) {
+        const uuid = item && item.job && item.job.job_uuid;
+        if (uuid) fila.emCurso.delete(uuid);
+      }
+    }
+  }
+
   async function despachar(lote) {
     try {
       await imprimir(lote);
       if (lote.length > 1) registrar(`lote de ${lote.length} etiqueta(s) em UMA chamada`);
       for (const item of lote) confirmar(item, 'success', null);
+      liberar(lote);
       return;
     } catch (erro) {
       // Lote de um só JÁ é o caso individual: não há o que refazer.
       if (lote.length === 1) {
         confirmar(lote[0], 'error', erro && erro.message ? erro.message : String(erro));
+        /*
+         * ⚠️ LIBERA também no erro. Sem isto o uuid ficaria ocupando a fila
+         * para sempre e a etiqueta nunca mais entraria — trocando a
+         * duplicata por uma perda, que é pior.
+         */
+        liberar(lote);
         return;
       }
       registrar(
