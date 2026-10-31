@@ -290,7 +290,109 @@ function criarPreparoDeImpressora({
     ultimoPreparo.clear();
   }
 
-  return { preparar, esquecer };
+  /**
+   * O comando de preparo PARA IR COLADO na frente da etiqueta — ou `null`.
+   *
+   * ══════════════════════════════════════════════════════════════════════════
+   * 🚨 MANDAR 5 BYTES CUSTOU 16 SEGUNDOS (31/10/2026)
+   * ══════════════════════════════════════════════════════════════════════════
+   * Medido no `print.log` da RDF (LAPTOP-KO8NI12G, 16 filas instaladas), com
+   * a 1.0.24 cronometrando cada etapa:
+   *
+   *   [zpl]     1 etiqueta(s),   0 KB aceitos pelo winspool em 16182 ms  ← preparo
+   *   [preparo] bidi_ja_estava_desligado — bidirecional levou 11610 ms
+   *   [zpl]     1 etiqueta(s),  41 KB aceitos pelo winspool em  2425 ms  ← etiqueta
+   *   [zpl]     9 etiqueta(s), 335 KB aceitos pelo winspool em  2687 ms
+   *
+   * 27,8 s de preparação para 5,1 s de impressão. E o número que decide:
+   * **5 bytes levaram 16 s e 335 KB levaram 2,7 s** — o custo não é o volume,
+   * é ABRIR a impressora no spooler. Hoje abrimos duas vezes (o comando e a
+   * etiqueta); colado, abre uma.
+   *
+   * ⚠️ Só serve quando a linguagem do PREPARO é a mesma do JOB. Numa Zebra em
+   * modo EPL o `~JSA` é ignorado e o `JB` é o que vale — mandar o comando de
+   * uma linguagem colado no formato de outra é pior que não preparar.
+   *
+   * ⚠️ **Não marca nada.** Quem envia é que sabe se chegou, e chama
+   * `confirmarPreparo` depois. Marcar aqui faria o preparo ser "feito" mesmo
+   * quando a etiqueta falhou, e a impressora ficaria uma hora sem o comando.
+   */
+  function comandoColado(nomeDaImpressora, opcoes = {}) {
+    if (opcoes.ligado === false) return null;
+    const doDriver = linguagemDaImpressora(nomeDaImpressora);
+    if (!doDriver || !ehZebra(nomeDaImpressora)) return null;
+
+    /*
+     * ⚠️ A linguagem do JOB tem de ser explícita E igual à do DRIVER.
+     *
+     * Aqui a regra é MAIS ESTRITA que no `preparar()`, de propósito. Lá o job
+     * manda, porque a Zebra troca de linguagem sozinha ao ver o `^XA`. Mas o
+     * comando colado vai ANTES do `^XA`: naquele instante a impressora ainda
+     * está no modo do driver, e um `~JSA` lido em modo EPL não é comando — é
+     * lixo. Quando as duas divergem, o caminho antigo (envio separado)
+     * continua valendo, com o comportamento idêntico ao de hoje.
+     *
+     * ⚠️ Defeito meu que o teste pegou em 31/10/2026: a comparação era contra
+     * `opcoes.linguagem || doDriver`, que é a própria `opcoes.linguagem`
+     * quando ela existe — a guarda nunca podia falhar, e um job ZPL colava o
+     * `~JSA` numa impressora em modo EPL.
+     */
+    if (!opcoes.linguagem || opcoes.linguagem !== doDriver) return null;
+    const linguagem = doDriver;
+
+    const chave = `${nomeDaImpressora}\u0000${linguagem}`;
+    const ultimo = ultimoPreparo.get(chave);
+    if (ultimo && agora() - ultimo < intervaloMs) return null;
+
+    return { chave, texto: comandosDePreparo({ ...opcoes, linguagem }), linguagem };
+  }
+
+  /** O envio que levava o comando colado deu certo: conta o preparo. */
+  function confirmarPreparo(chave) {
+    if (chave) ultimoPreparo.set(chave, agora());
+  }
+
+  /**
+   * Desliga o bidirecional DEPOIS da etiqueta — fora do caminho crítico.
+   *
+   * ⚠️ Medido na RDF em 31/10/2026: **11.610 ms** de consulta WMI, e ela
+   * rodava ANTES da primeira etiqueta. O bidirecional é otimização para as
+   * etiquetas SEGUINTES (é ele que tira a pausa entre elas), então esperar
+   * por ele antes de o papel começar a sair é pagar o custo na hora errada.
+   *
+   * ⚠️ **Nunca lança e nunca é esperado.** Quem chama usa `void`. Falha aqui
+   * não pode derrubar impressão que já deu certo — era assim no `preparar()`
+   * e continua sendo.
+   *
+   * ⚠️ Memória PRÓPRIA, separada da do preparo: o comando ZPL e a
+   * configuração do spooler são coisas diferentes, e misturá-las faria o
+   * bidi deixar de rodar sempre que o preparo tivesse ido colado.
+   */
+  const ultimoBidi = new Map();
+
+  async function desligarBidiDepois(nomeDaImpressora, opcoes = {}) {
+    if (!desligarBidi || opcoes.bidi === false) return 'desligado';
+    if (!ehZebra(nomeDaImpressora)) return 'nao_e_zebra';
+    const ultimo = ultimoBidi.get(nomeDaImpressora);
+    if (ultimo && agora() - ultimo < intervaloMs) return 'recente';
+
+    const t = agora();
+    try {
+      const r = await desligarBidi(nomeDaImpressora);
+      ultimoBidi.set(nomeDaImpressora, agora());
+      registrar(`${nomeDaImpressora}: ${r} — bidirecional levou ${agora() - t} ms (fora do caminho)`);
+      return 'ok';
+    } catch (erro) {
+      // Não marca: a próxima impressão tenta de novo.
+      registrar(
+        `${nomeDaImpressora}: nao foi possivel desligar o bidirecional em ${agora() - t} ms ` +
+          `(${erro && erro.message ? erro.message : erro})`,
+      );
+      return 'falhou';
+    }
+  }
+
+  return { preparar, esquecer, comandoColado, confirmarPreparo, desligarBidiDepois };
 }
 
 /**
@@ -314,8 +416,27 @@ function comandoDesligarBidi(nomeDaImpressora) {
   );
 }
 
+/**
+ * Cola o comando de preparo na frente do corpo da etiqueta.
+ *
+ * ⚠️ Existe como função SEPARADA porque a montagem ficava dentro do
+ * `main.js` e, ao verificar desfazendo em 31/10/2026, removê-la passou pelos
+ * 29 casos estruturais sem nenhum vermelho — eles conferem presença de
+ * código, não bytes. Aqui a asserção é sobre o RESULTADO: o corpo da
+ * etiqueta sai intacto e o comando vem antes dele.
+ *
+ * ⚠️ `ascii` e não `utf8`: o preparo é `~JSA`/`JB`, sempre ASCII puro, e a
+ * impressora lê byte a byte. Um BOM ou um acento aqui vira caractere de
+ * controle no meio do fluxo ZPL.
+ */
+function colarNaEtiqueta(textoDoPreparo, corpo) {
+  if (!textoDoPreparo) return corpo;
+  return Buffer.concat([Buffer.from(textoDoPreparo, 'ascii'), corpo]);
+}
+
 module.exports = {
   criarPreparoDeImpressora,
+  colarNaEtiqueta,
   comandoDesligarBidi,
   comandosDePreparo,
   ehZebra,

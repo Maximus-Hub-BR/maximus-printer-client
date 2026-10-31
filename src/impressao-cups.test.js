@@ -12,6 +12,8 @@ const {
   argumentosDePdf,
   argumentosDeZplRaw,
   interpretarLpstat,
+  argumentosDeEstadoDaFila,
+  filaEstaPausada,
 } = require('./impressao-cups')
 
 let passaram = 0
@@ -79,6 +81,64 @@ teste('mensagem de erro do lpstat não vira impressora', () => {
   assert.deepStrictEqual(interpretarLpstat('lpstat: No destinations added.\n'), [])
   assert.deepStrictEqual(interpretarLpstat(''), [])
   assert.deepStrictEqual(interpretarLpstat(null), [])
+})
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 A FILA PAUSADA — o ACK que dizia sucesso com 5 lotes parados
+ * ══════════════════════════════════════════════════════════════════════════
+ * Caso real medido no Hub em 31/10/2026: 5 ondas de 21 etiquetas, todas
+ * `success` com ACK em 0-1 s, e nenhuma saiu no papel. O `lp` enfileira e
+ * volta na hora; a fila do CUPS estava pausada e tudo esperava. Só o clique
+ * em "retomar" liberou.
+ *
+ * As frases abaixo são as REAIS do `lpstat -p` de um Mac — copiadas da saída,
+ * não inventadas.
+ */
+
+teste('🚨 fila pausada é reconhecida em português', () => {
+  assert.strictEqual(
+    filaEstaPausada('impressora HP_LaserJet_Professional_P_1102w desativada desde Tue Sep 14 16:22:25 2021 -\n\tConnection refused'),
+    true,
+  )
+})
+
+teste('🚨 fila pausada é reconhecida em inglês', () => {
+  assert.strictEqual(filaEstaPausada('printer TOMATE_MDK_008 disabled since Fri Oct 31 10:14:00 2026 -'), true)
+})
+
+teste('🚨 fila SAUDÁVEL não é confundida — "ativada" não casa com "desativada"', () => {
+  // A linha de quem está bem contém a palavra `ativada`. Sem o limite de
+  // palavra no regex, TODA impressora boa viraria pendência para o operador.
+  assert.strictEqual(
+    filaEstaPausada('impressora HP_Color_LaserJet_Pro_4203 está ociosa.  ativada desde Fri Oct 16 08:58:35 2026'),
+    false,
+  )
+  assert.strictEqual(filaEstaPausada('printer TOMATE is idle.  enabled since Fri Oct 16 08:58:35 2026'), false)
+})
+
+teste('⚠️ falha ABERTA: saída vazia ou desconhecida NÃO acusa nada', () => {
+  // "Não sei" nunca pode virar pendência: marcar erro por não entender a
+  // saída faria etiqueta boa aparecer como não impressa.
+  assert.strictEqual(filaEstaPausada(''), false)
+  assert.strictEqual(filaEstaPausada(null), false)
+  assert.strictEqual(filaEstaPausada(undefined), false)
+  assert.strictEqual(filaEstaPausada('   '), false)
+  assert.strictEqual(filaEstaPausada('lpstat: Invalid destination name'), false)
+  assert.strictEqual(filaEstaPausada('qualquer coisa que não reconhecemos'), false)
+})
+
+teste('o estado é perguntado de UMA fila, não de todas', () => {
+  // Numa máquina com 16 filas, perguntar por todas custa segundos.
+  assert.deepStrictEqual(argumentosDeEstadoDaFila('ZDesigner ZD220'), ['-p', 'ZDesigner ZD220'])
+})
+
+teste('⚠️ o nome vai como ARGUMENTO, nunca dentro de uma string de shell', () => {
+  // Nome com espaço e aspas é comum em fila do macOS.
+  const args = argumentosDeEstadoDaFila('Zebra "do balcão" 2')
+  assert.strictEqual(args.length, 2)
+  assert.strictEqual(args[1], 'Zebra "do balcão" 2')
+  for (const a of args) assert.ok(!a.includes('&&') && !a.includes(';'))
 })
 
 for (const [nome, fn] of casos) {
