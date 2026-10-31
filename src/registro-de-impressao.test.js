@@ -5,7 +5,11 @@
  * incidente de 30/10/2026 (ver o cabeçalho do módulo).
  */
 const assert = require('assert');
-const { criarRegistroDeImpressao, HORAS_DE_MEMORIA } = require('./registro-de-impressao');
+const {
+  criarRegistroDeImpressao,
+  HORAS_DE_MEMORIA,
+  HORAS_DE_DUVIDA,
+} = require('./registro-de-impressao');
 
 let passaram = 0;
 const casos = [];
@@ -197,6 +201,111 @@ teste('marcarEnviando não sobrescreve um job que JÁ saiu', () => {
   reg.marcarImpresso('u-1', 'success', null);
   reg.marcarEnviando('u-1');
   assert.strictEqual(reg.estadoDe('u-1'), 'impresso');
+});
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 QUAL DÚVIDA O PULL DECLARA AO HUB (30/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * O Hub não sabe se o papel saiu; este registro sabe. Medido em dois ensaios
+ * de queda com identidade por etiqueta: das 19 etiquetas recuperadas em cada
+ * leva, **19 eram inéditas** — e saíram todas marcadas `REIMPRESSAO`, que é
+ * convite ao descarte. `emEnviando()` é o que separa a dúvida real do resto.
+ */
+
+teste('🚨 emEnviando: job INÉDITO não entra na lista', () => {
+  const { reg } = memoria();
+  // Nunca vimos este job — e é o caso das 19 de cada leva.
+  assert.deepStrictEqual(reg.emEnviando(), []);
+});
+
+teste('emEnviando: job IMPRESSO e confirmado não é dúvida', () => {
+  const { reg } = memoria();
+  reg.marcarEnviando('u-ok');
+  reg.marcarImpresso('u-ok', 'success', null);
+  reg.marcarConfirmado('u-ok');
+  assert.deepStrictEqual(reg.emEnviando(), []);
+});
+
+teste('🚨 emEnviando: só o job que foi ao papel e não teve desfecho', () => {
+  const { reg } = memoria();
+  reg.marcarEnviando('u-duvida');          // o processo morreria exatamente aqui
+  reg.marcarEnviando('u-saiu');
+  reg.marcarImpresso('u-saiu', 'success', null);
+  assert.deepStrictEqual(reg.emEnviando(), ['u-duvida']);
+});
+
+teste('emEnviando: job com ERRO não é dúvida (sabemos que NÃO saiu)', () => {
+  const { reg } = memoria();
+  reg.marcarEnviando('u-erro');
+  reg.marcarImpresso('u-erro', 'error', 'sem papel');
+  assert.deepStrictEqual(reg.emEnviando(), []);
+});
+
+teste('⚠️ emEnviando: tem teto e manda os MAIS RECENTES', () => {
+  let t = 1000;
+  const { reg } = memoria({}, () => (t += 1000));
+  for (let i = 0; i < 30; i += 1) reg.marcarEnviando(`u-${i}`);
+  const lista = reg.emEnviando(5);
+  assert.strictEqual(lista.length, 5);
+  // O teto existe porque a lista vai na URL e o servidor descarta lista
+  // absurda INTEIRA; mandar os recentes preserva a marca no job da queda.
+  assert.ok(lista.includes('u-29'), 'o mais recente tem de estar na lista');
+  assert.ok(!lista.includes('u-0'), 'o mais antigo não deveria estar');
+});
+
+teste('🚨 emEnviando: sobrevive à leitura do DISCO (é o caso do crash)', () => {
+  const { reg, disco } = memoria();
+  reg.marcarEnviando('u-crash');
+  // `marcarEnviando` grava na hora — é por isto que a dúvida sobrevive ao
+  // processo morrer. Um segundo registro lendo o mesmo disco tem de vê-la.
+  const segundo = criarRegistroDeImpressao({ ler: () => disco(), gravar: () => {} });
+  assert.deepStrictEqual(segundo.emEnviando(), ['u-crash']);
+});
+
+teste('🚨 dúvida VENCIDA não é mais declarada (órfão não marca papel por engano)', () => {
+  let t = 10 * 24 * 3600000;                 // um instante qualquer, longe de 0
+  const { reg } = memoria({}, () => t);
+  reg.marcarEnviando('u-velho');
+  // Passam HORAS_DE_DUVIDA + 1 h. O pull do Hub só olha 2 h para trás, então
+  // esta entrada já não pode voltar por ali — e deixar de ser dúvida é o
+  // certo: se o job reaparecer por outro caminho, não leva marca.
+  t += (HORAS_DE_DUVIDA + 1) * 3600000;
+  assert.deepStrictEqual(reg.emEnviando(), []);
+});
+
+teste('dúvida DENTRO do prazo continua declarada', () => {
+  let t = 10 * 24 * 3600000;
+  const { reg } = memoria({}, () => t);
+  reg.marcarEnviando('u-novo');
+  t += (HORAS_DE_DUVIDA - 1) * 3600000;
+  assert.deepStrictEqual(reg.emEnviando(), ['u-novo']);
+});
+
+teste('🚨 a PODA remove o `enviando` vencido (sem isto ele ficava para sempre)', () => {
+  let t = 10 * 24 * 3600000;
+  const { reg, disco } = memoria({}, () => t);
+  reg.marcarEnviando('u-orfao');
+  assert.ok(disco()['u-orfao'], 'deveria estar gravado');
+  t += (HORAS_DE_DUVIDA + 1) * 3600000;
+  reg.salvar();                              // `salvar` é quem poda
+  assert.strictEqual(
+    disco()['u-orfao'],
+    undefined,
+    'orfao em `enviando` nunca saía: a poda só olhava `confirmado`, e ele nasce false',
+  );
+});
+
+teste('⚠️ a poda NÃO leva quem tem desfecho e ACK pendente (a regra original)', () => {
+  let t = 10 * 24 * 3600000;
+  const { reg, disco } = memoria({}, () => t);
+  reg.marcarImpresso('u-sem-ack', 'success', null);   // desfecho, sem confirmar
+  t += (HORAS_DE_MEMORIA + 1) * 3600000;
+  reg.salvar();
+  assert.ok(
+    disco()['u-sem-ack'],
+    'aquele ACK é a única notícia que o Hub vai receber — não pode ser podado',
+  );
 });
 
 for (const [nome, fn] of casos) {

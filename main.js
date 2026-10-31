@@ -677,9 +677,23 @@ async function puxarPendentes () {
 
   pullEmCurso = true
   try {
+    /*
+     * ⚠️ `suspeitos`: os job_uuid que FOMOS imprimir e cujo desfecho nunca
+     * soubemos (estado `'enviando'`). Só eles levam marca no papel — ver o
+     * cabeçalho de `registroDeImpressao.emEnviando`. Sem isto o Hub carimba
+     * `REIMPRESSAO` em etiqueta inédita, e quem lê descarta trabalho bom.
+     *
+     * ⚠️ Na URL de propósito: é GET, a lista tem 1 a 3 itens na prática, e
+     * assim a rota antiga continua respondendo a clientes que não informam.
+     */
+    const suspeitos = registroDeImpressao.emEnviando()
     const resposta = await axios.get(
       `${HUB_API}/print-agents/${agentUuid}/jobs/pendentes`,
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 30000 },
+      {
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 30000,
+        ...(suspeitos.length ? { params: { suspeitos: suspeitos.join(',') } } : {}),
+      },
     )
     const jobs = (resposta.data && resposta.data.data) || []
     if (!jobs.length) return

@@ -207,6 +207,31 @@ teste('o pull tem trava de concorrência (connect + temporizador podem coincidir
   assert.ok(main.includes('if (pullEmCurso) return'));
 });
 
+teste('🚨 o pull DECLARA os suspeitos ao Hub (senão a marca sai em etiqueta inédita)', () => {
+  /*
+   * A informação existe no registro local e, até 30/10/2026, não chegava ao
+   * Hub: ele carimbava `REIMPRESSAO` em tudo que reentregava — 19 de 19
+   * inéditas em cada um dos dois ensaios de queda. Sem esta chamada a
+   * correção do backend não tem efeito nenhum, e nada quebra: as etiquetas
+   * só voltam a sair sem marca. Defeito mudo, a classe mais cara da casa.
+   */
+  assert.ok(
+    main.includes('registroDeImpressao.emEnviando()'),
+    'o pull voltou a não perguntar ao registro o que está em dúvida',
+  );
+  assert.ok(
+    /params:\s*\{\s*suspeitos:\s*suspeitos\.join\(','\)\s*\}/.test(main),
+    'os suspeitos não estão sendo enviados na requisição do pull',
+  );
+});
+
+teste('⚠️ lista vazia NÃO manda o parâmetro (a rota antiga segue respondendo)', () => {
+  assert.ok(
+    /suspeitos\.length\s*\?\s*\{\s*params/.test(main),
+    'mandar `suspeitos=` vazio é diferente de não mandar — não force o parâmetro',
+  );
+});
+
 for (const [nome, fn] of casos) {
   try { fn(); passaram++; console.log(`  ✓ ${nome}`); }
   catch (erro) { console.error(`  ✗ ${nome}\n    ${erro.message}`); process.exitCode = 1; }
