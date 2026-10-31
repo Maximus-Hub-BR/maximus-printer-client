@@ -372,6 +372,7 @@ function registrar (mensagem) {
 // isso está em `src/registro-de-impressao.test.js`.
 const { criarRegistroDeImpressao } = require('./src/registro-de-impressao')
 const { interpretarLogin, metodosQuePrecisamEnvio, mensagemDeConfiguracao } = require('./src/resposta-de-login')
+const { decidirSobreJob, aplicarDecisaoDoJob } = require('./src/decisao-do-job')
 
 /**
  * O REGISTRO do que já saiu no papel — `src/registro-de-impressao.js`.
@@ -543,6 +544,7 @@ const filaDeImpressao = criarFilaDeImpressao({
     registroDeImpressao.salvar()
     if (!mqttClient || !mqttClient.connected) {
       // Fica pendente de propósito: o HTTP resolve.
+      registrar(`[ack] ${item.job.job_uuid}: MQTT offline — fica pendente para o HTTP`)
       agendarAcksPendentes()
       return
     }
@@ -552,11 +554,21 @@ const filaDeImpressao = criarFilaDeImpressao({
       { qos: 1 },
       (erroDoPublish) => {
         if (erroDoPublish) {
+          /*
+           * ⚠️ LOGADO (31/10/2026). Este caminho era MUDO, e isso custou
+           * tempo: a sessão que operava a VM procurou no `print.log` o ACK
+           * de 40 etiquetas e não achou nenhum — nem das 39 que o banco
+           * provava confirmadas. Ausência de linha não distinguia "não
+           * mandou" de "mandou e não logou", e sem isso não há como provar
+           * o ACK pelo lado do cliente.
+           */
+          registrar(`[ack] ${item.job.job_uuid}: MQTT falhou (${erroDoPublish.message || erroDoPublish}) — vai por HTTP`)
           agendarAcksPendentes()
           return
         }
         // PUBACK recebido: o broker tem o ACK.
         registroDeImpressao.marcarConfirmado(item.job.job_uuid)
+        registrar(`[ack] ${item.job.job_uuid} confirmado por MQTT (${status})`)
         agendarGravacaoDoRegistro()
       },
     )
@@ -697,62 +709,22 @@ async function puxarPendentes () {
     )
     const jobs = (resposta.data && resposta.data.data) || []
     if (!jobs.length) return
-    let enfileirados = 0
-    let jaImpressos = 0
-    let naoResolvidos = 0
+    /*
+     * ⚠️ O pull NÃO decide — ele pergunta ao `enfileirar`, que é o ponto
+     * único. Até a 1.0.22 os dois decidiam, com regras diferentes, e a do
+     * `enfileirar` ganhava: a etiqueta em dúvida nunca era impressa, em
+     * silêncio. Ver `src/decisao-do-job.js`.
+     */
+    const contagem = { imprimir: 0, reimprimir: 0, ja_impresso: 0, esgotado: 0 }
     for (const job of jobs) {
-      if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
-        /*
-         * ⚠️ O Hub REOFERECER este job é a prova de que ele não tem o nosso
-         * ACK — ainda que o MQTT tenha dado PUBACK (que prova entrega ao
-         * BROKER, não registro no Hub). Sem desmarcar, o job voltava em todo
-         * pull para sempre: medido em 30/10/2026, dois ficaram nesse laço a
-         * cada 2 minutos, e na tela como "não confirmada" que nunca some.
-         *
-         * ⚠️ Job em `enviando` é outra história: o processo morreu entre o
-         * papel sair e o registro saber, e é impossível dizer se saiu.
-         * Reimprime — mas no máximo UMA vez a mais (ver
-         * `podeReimprimir`): sem teto, uma máquina instável vira pilha de
-         * duplicatas. Esgotado o limite, quem decide é a pessoa, pela tela.
-         */
-        if (registroDeImpressao.podeReimprimir(job.job_uuid)) {
-          enfileirar(job, userId)
-          enfileirados++
-          continue
-        }
-        /*
-         * 🚨 Limite esgotado: o cliente PARA de reimprimir — mas o desfecho
-         * é um ERRO, nunca um "sucesso". Confirmar como impressa uma
-         * etiqueta que talvez não tenha saído a faria SUMIR da tela, e aí a
-         * perda volta a ser silenciosa, que é o defeito original de
-         * 30/10/2026. Como erro, ela aparece para a pessoa conferir o papel
-         * e decidir — que é a única coisa honesta a fazer quando o sistema
-         * não sabe.
-         */
-        if (registroDeImpressao.estadoDe(job.job_uuid) === 'enviando') {
-          registroDeImpressao.marcarImpresso(
-            job.job_uuid,
-            'error',
-            'o app foi encerrado durante o envio e o limite de tentativas acabou — confira o papel',
-          )
-          registroDeImpressao.salvar()
-          registrar(`[pull] ${job.job_uuid}: limite de tentativas atingido — marcado para conferência`)
-          naoResolvidos++
-          agendarAcksPendentes()
-          continue
-        }
-        registroDeImpressao.precisaReconfirmar(job.job_uuid)
-        jaImpressos++
-        continue
-      }
-      enfileirar(job, userId)
-      enfileirados++
+      const decisao = enfileirar(job, userId)
+      if (decisao in contagem) contagem[decisao] += 1
     }
-    if (jaImpressos) agendarAcksPendentes()
     registrar(
-      `[pull] ${jobs.length} pendente(s) no Hub: ${enfileirados} para imprimir, ` +
-        `${jaImpressos} já impresso(s) (reconfirmando)` +
-        (naoResolvidos ? `, ${naoResolvidos} para CONFERÊNCIA (limite de tentativas)` : ''),
+      `[pull] ${jobs.length} pendente(s) no Hub: ${contagem.imprimir} para imprimir` +
+        (contagem.reimprimir ? `, ${contagem.reimprimir} em DÚVIDA (reimprimindo)` : '') +
+        `, ${contagem.ja_impresso} já impresso(s) (reconfirmando)` +
+        (contagem.esgotado ? `, ${contagem.esgotado} para CONFERÊNCIA (limite de tentativas)` : ''),
     )
   } catch (erro) {
     const detalhe = erro && erro.response ? `HTTP ${erro.response.status}` : (erro && erro.message) || erro
@@ -774,23 +746,39 @@ function ligarRotinasDeContinuidade () {
 }
 
 /**
- * Enfileira um job — com a trava que impede imprimir duas vezes.
+ * Enfileira um job — e é o PONTO ÚNICO que decide o que fazer com ele.
  *
  * 🚨 O job pode chegar DUAS vezes: pelo MQTT e pelo pull de pendentes (ou
  * duas vezes pelo pull, se o ACK não tiver sido aceito ainda). Imprimir de
  * novo é colar etiqueta errada no pacote — então, se este `job_uuid` já saiu
- * no papel, o cliente **reconfirma** em vez de imprimir. É esse caminho que
- * conserta o estado do Hub sem gastar papel.
+ * no papel, o cliente **reconfirma** em vez de imprimir.
+ *
+ * 🚨 MAS "tem entrada no registro" NÃO é "já saiu no papel" — e confundir os
+ * dois fazia a etiqueta em DÚVIDA nunca ser impressa, em silêncio. A regra,
+ * a medição e o porquê de centralizar estão em `src/decisao-do-job.js`; leia
+ * antes de mexer aqui.
+ *
+ * Devolve o que decidiu, para quem chamou poder contar sem repetir a regra.
  */
 function enfileirar (job, userId) {
-  if (job && job.job_uuid && registroDeImpressao.jaImprimiu(job.job_uuid)) {
-    // Mesma razão do pull: se chegou de novo, o Hub não tem o nosso ACK.
-    registroDeImpressao.precisaReconfirmar(job.job_uuid)
-    registrar(`[fila] ${job.job_uuid} já foi impresso — reconfirmando, sem imprimir de novo`)
-    agendarAcksPendentes()
-    return
+  const uuid = job && job.job_uuid
+  if (!uuid) {
+    filaDeImpressao.enfileirar(job, userId)
+    return 'imprimir'
   }
-  return filaDeImpressao.enfileirar(job, userId)
+
+  return aplicarDecisaoDoJob({
+    job,
+    userId,
+    decisao: decidirSobreJob({
+      estado: registroDeImpressao.estadoDe(uuid),
+      podeReimprimir: registroDeImpressao.podeReimprimir(uuid),
+    }),
+    registro: registroDeImpressao,
+    imprimir: (j, u) => filaDeImpressao.enfileirar(j, u),
+    registrar,
+    agendarAcks: agendarAcksPendentes,
+  })
 }
 
 // Escala de impressão por impressora (local). Modos:

@@ -101,10 +101,27 @@ teste('⚠️ cliente offline NÃO perde o ACK (deixa pendente para o HTTP)', ()
   );
 });
 
-teste('🚨 o enfileirar DESCARTA job já impresso (a trava da duplicata do pull)', () => {
-  const trecho = main.slice(posicao('function enfileirar (job, userId) {'), posicao('function enfileirar (job, userId) {') + 600);
-  assert.ok(trecho.includes('registroDeImpressao.jaImprimiu(job.job_uuid)'));
-  assert.ok(trecho.includes('agendarAcksPendentes()'), 'job já impresso tem de ser RECONFIRMADO');
+teste('🚨 o enfileirar DELEGA para a regra única (a invariante está em decisao-do-job)', () => {
+  /*
+   * ⚠️ ATUALIZADO 2x em 31/10/2026, e o histórico importa:
+   *  1. o caso afirmava `jaImprimiu(job.job_uuid)` — e era essa chamada o
+   *     defeito: ela dá `true` para `enviando`, que significa "não sei se
+   *     saiu". A etiqueta em dúvida nunca era impressa;
+   *  2. depois o corpo inteiro saiu daqui e foi para `decisao-do-job.js`,
+   *     porque reintroduzir o defeito deixava estes 29 casos VERDES — eles
+   *     conferem presença de código, não efeito.
+   * Agora a invariante ("já saiu ⇒ não imprime"; "dúvida ⇒ imprime com
+   * teto") é provada por EFEITO em `decisao-do-job.test.js`, com duplos. O
+   * que SOBRA para este arquivo é garantir que o main.js delega — se ele
+   * voltar a decidir sozinho, a divergência volta.
+   */
+  const trecho = main.slice(posicao('function enfileirar (job, userId) {'), posicao('function enfileirar (job, userId) {') + 700);
+  assert.ok(trecho.includes('aplicarDecisaoDoJob({'), 'o enfileirar parou de delegar');
+  assert.ok(trecho.includes('decisao: decidirSobreJob({'), 'a decisão saiu da regra única');
+  // As portas: sem elas a regra não tem como agir.
+  for (const porta of ['registro: registroDeImpressao', 'imprimir:', 'registrar,', 'agendarAcks:']) {
+    assert.ok(trecho.includes(porta), `porta ausente: ${porta}`);
+  }
 });
 
 teste('🚨 o registro marca ENVIANDO antes de qualquer byte sair', () => {
@@ -136,9 +153,16 @@ teste('🚨 job reoferecido pelo Hub é DESMARCADO para reconfirmar', () => {
   /*
    * Dois jobs voltavam em todo pull para sempre: o cliente os tinha como
    * confirmados (PUBACK do broker) e nunca os reenviava; o Hub nunca soube.
+   *
+   * ⚠️ ATUALIZADO em 31/10/2026: a chamada mudou de arquivo junto com o
+   * resto da decisão. Ter a regra em dois lugares É o defeito que causou a
+   * perda por dúvida — então o que se trava aqui é que o main.js NÃO a tem,
+   * e o módulo SIM.
    */
-  const ocorrencias = (main.match(/registroDeImpressao\.precisaReconfirmar\(/g) || []).length;
-  assert.strictEqual(ocorrencias, 2, `esperava 2 (pull e fila), achei ${ocorrencias}`);
+  const noMain = (main.match(/registroDeImpressao\.precisaReconfirmar\(/g) || []).length;
+  assert.strictEqual(noMain, 0, `a decisão voltou para o main.js (${noMain} chamada(s))`);
+  const modulo = require('fs').readFileSync(require('path').join(__dirname, 'decisao-do-job.js'), 'utf8');
+  assert.ok(modulo.includes('registro.precisaReconfirmar(uuid)'), 'a reconfirmação desapareceu da regra');
 });
 
 teste('🚨 o pull roda no connect, e os ACKs vão ANTES dele', () => {
@@ -158,12 +182,16 @@ teste('🚨 o pull respeita o TETO de tentativas (não vira pilha de duplicatas)
 teste('🚨 limite esgotado vira ERRO visível, nunca "sucesso"', () => {
   /*
    * Confirmar como impressa uma etiqueta que talvez não tenha saído a faria
-   * SUMIR da tela — e aí a perda volta a ser silenciosa, que é o defeito
-   * original de 30/10/2026.
+   * SUMIR da tela — e aí a perda volta a ser silenciosa.
+   *
+   * ⚠️ ATUALIZADO em 31/10/2026: mora em `decisao-do-job.js`, e o EFEITO
+   * ("não imprime, marca error, grava") é provado lá com duplos. Aqui fica a
+   * garantia de que a mensagem continua dizendo o que a pessoa deve fazer.
    */
-  const trecho = main.slice(posicao('async function puxarPendentes'), posicao('function ligarRotinasDeContinuidade'));
-  assert.ok(/marcarImpresso\([\s\S]{0,80}'error'/.test(trecho), 'o limite não marca erro');
-  assert.ok(trecho.includes('confira o papel'), 'a mensagem não diz o que a pessoa deve fazer');
+  const modulo = require('fs').readFileSync(require('path').join(__dirname, 'decisao-do-job.js'), 'utf8');
+  assert.ok(modulo.includes("decisao === 'esgotado'"), 'o ramo do teto esgotado desapareceu');
+  assert.ok(/marcarImpresso\([\s\S]{0,120}'error'/.test(modulo), 'o limite não marca erro');
+  assert.ok(modulo.includes('confira o papel'), 'a mensagem não diz o que a pessoa deve fazer');
 });
 
 teste('⚠️ as rotinas periódicas existem e não dependem de evento de rede', () => {
@@ -230,6 +258,76 @@ teste('⚠️ lista vazia NÃO manda o parâmetro (a rota antiga segue responden
     /suspeitos\.length\s*\?\s*\{\s*params/.test(main),
     'mandar `suspeitos=` vazio é diferente de não mandar — não force o parâmetro',
   );
+});
+
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 A DECISÃO MORA EM UM LUGAR SÓ (31/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * Medido em produção: a etiqueta em DÚVIDA era descartada pelo `enfileirar`
+ * como "já impressa" e nunca saía — 3 ciclos de pull seguidos, zero papel,
+ * zero ACK. O pull decidia certo e o `enfileirar` o atropelava.
+ */
+
+teste('🚨 o enfileirar NÃO usa jaImprimiu (ele dá true para a DÚVIDA)', () => {
+  assert.ok(
+    !/function enfileirar[\s\S]{0,400}registroDeImpressao\.jaImprimiu/.test(main),
+    'o guard voltou a tratar qualquer entrada do registro como "já impresso"',
+  );
+});
+
+teste('🚨 o enfileirar decide pela regra ÚNICA, e passa estado + teto', () => {
+  assert.ok(
+    /function enfileirar[\s\S]{0,600}decidirSobreJob\(\{/.test(main),
+    'a decisão saiu do ponto único',
+  );
+  assert.ok(main.includes('estado: registroDeImpressao.estadoDe(uuid)'));
+  assert.ok(main.includes('podeReimprimir: registroDeImpressao.podeReimprimir(uuid)'));
+});
+
+teste('🚨 a DÚVIDA chega à fila de verdade (provado por efeito no módulo)', () => {
+  /*
+   * ⚠️ Este caso era estrutural e NÃO pegava o defeito: com a dúvida
+   * tratada como impressa, ele passava. A prova real é o caso
+   * "EFEITO: a etiqueta em dúvida VAI para a fila" em
+   * `decisao-do-job.test.js` — verificado desfazendo, 3 casos vermelhos.
+   * Aqui só se garante que a porta `imprimir` do main.js aponta para a fila
+   * de verdade: se ela virar um no-op, a regra fica certa e nada imprime.
+   */
+  const trecho = main.slice(posicao('function enfileirar (job, userId) {'), posicao('function enfileirar (job, userId) {') + 700);
+  assert.ok(
+    /imprimir: \(j, u\) => filaDeImpressao\.enfileirar\(j, u\)/.test(trecho),
+    'a porta `imprimir` não vai mais para a fila de impressão',
+  );
+});
+
+teste('⚠️ o PULL não decide mais — só lê o veredito do enfileirar', () => {
+  const pull = main.slice(main.indexOf('async function puxarPendentes'));
+  const corpo = pull.slice(0, pull.indexOf('async function', 20));
+  assert.ok(
+    !corpo.includes('registroDeImpressao.jaImprimiu'),
+    'o pull voltou a decidir por conta própria — é a divergência que causou a perda',
+  );
+  assert.ok(
+    /const decisao = enfileirar\(job, userId\)/.test(corpo),
+    'o pull precisa usar o retorno do enfileirar',
+  );
+});
+
+teste('🚨 todo caminho de ACK LOGA (ausência de linha não provava nada)', () => {
+  // A sessão da VM procurou no print.log o ACK de 40 etiquetas e não achou
+  // nenhum — nem das 39 que o banco provava confirmadas.
+  assert.ok(main.includes('confirmado por MQTT'), 'o ACK por MQTT voltou a ser mudo');
+  assert.ok(main.includes('MQTT offline — fica pendente para o HTTP'));
+  assert.ok(main.includes('MQTT falhou'));
+  assert.ok(main.includes('confirmação(ões) enviada(s) por HTTP'));
+});
+
+teste('⚠️ o require de decisao-do-job vem ANTES do uso (TDZ não aparece no --check)', () => {
+  const req = main.indexOf("require('./src/decisao-do-job')");
+  const uso = main.indexOf('decidirSobreJob({');
+  assert.ok(req > 0 && uso > 0, 'não achei require ou uso');
+  assert.ok(req < uso, 'o require ficou DEPOIS do uso: ReferenceError em produção');
 });
 
 for (const [nome, fn] of casos) {
