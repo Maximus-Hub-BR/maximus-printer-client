@@ -373,6 +373,11 @@ function registrar (mensagem) {
 const { criarRegistroDeImpressao } = require('./src/registro-de-impressao')
 const { interpretarLogin, metodosQuePrecisamEnvio, mensagemDeConfiguracao } = require('./src/resposta-de-login')
 const { decidirSobreJob, aplicarDecisaoDoJob } = require('./src/decisao-do-job')
+const {
+  decidirReinicio,
+  explicarReinicio,
+  INTERVALO_DE_TENTATIVA_MS,
+} = require('./src/atualizacao-critica')
 
 /**
  * O REGISTRO do que já saiu no papel — `src/registro-de-impressao.js`.
@@ -1775,6 +1780,8 @@ function setupAutoUpdater () {
       updateDownloaded = true
       notificar('MaximusHub Print Client', 'Atualização pronta! Clique no ícone da bandeja para instalar.')
       atualizarTray(trayStatus)
+      // Versão CRÍTICA se instala sozinha quando a máquina estiver ociosa.
+      void tentarReinicioAutomatico()
     })
 
     autoUpdater.on('error', (err) => {
@@ -1783,6 +1790,60 @@ function setupAutoUpdater () {
   } catch (err) {
     console.error('[UPDATE] Falha ao carregar electron-updater:', err.message)
   }
+}
+
+/** A versão declarada pelo Hub é obrigatória? (lido em `verificarAtualizacao`) */
+let atualizacaoObrigatoria = false
+/** Evita dois laços de tentativa rodando ao mesmo tempo. */
+let tentativaDeReinicio = null
+
+/**
+ * Instala a atualização CRÍTICA sozinho — quando for seguro.
+ *
+ * A regra de "é seguro" é pura e mora em `src/atualizacao-critica.js`, com
+ * as duas guardas e o porquê de cada uma. Aqui ficam só as PONTAS: perguntar
+ * à fila se há impressão, ao registro quantos ACKs faltam, e chamar o
+ * `quitAndInstall`.
+ *
+ * ⚠️ **Reavalia enquanto estiver ocupado**, em vez de desistir: a máquina da
+ * expedição passa o dia imprimindo em rajadas, e a janela ociosa chega. Quem
+ * desiste na primeira tentativa não atualiza nunca.
+ *
+ * ⚠️ **Manda os ACKs pendentes ANTES.** Reiniciar com ACK na mão faria o Hub
+ * achar que a etiqueta não saiu, e o pull a reimprimiria na volta — a mesma
+ * duplicata que este dia inteiro foi gasto corrigindo.
+ */
+async function tentarReinicioAutomatico () {
+  if (tentativaDeReinicio) return
+  tentativaDeReinicio = setInterval(() => void avaliarReinicio(), INTERVALO_DE_TENTATIVA_MS)
+  await avaliarReinicio()
+}
+
+async function avaliarReinicio () {
+  const pendentesDeAck = registroDeImpressao.pendentesDeConfirmacao().length
+  const { reiniciar, motivo } = decidirReinicio({
+    baixado: updateDownloaded,
+    obrigatoria: atualizacaoObrigatoria,
+    imprimindo: filaDeImpressao.ocupada(),
+    acksPendentes: pendentesDeAck,
+  })
+
+  if (!reiniciar) {
+    registrar(`[update] ${explicarReinicio(motivo)}`)
+    // Confirmação pendente é resolvível agora; impressão não.
+    if (motivo === 'acks_pendentes') await enviarAcksPendentes()
+    if (motivo === 'nao_obrigatoria' || motivo === 'sem_download') {
+      clearInterval(tentativaDeReinicio)
+      tentativaDeReinicio = null
+    }
+    return
+  }
+
+  registrar(`[update] ${explicarReinicio(motivo)}`)
+  clearInterval(tentativaDeReinicio)
+  tentativaDeReinicio = null
+  registroDeImpressao.salvar()
+  if (autoUpdater) autoUpdater.quitAndInstall(true, true)
 }
 
 async function verificarAtualizacao () {
@@ -1796,6 +1857,14 @@ async function verificarAtualizacao () {
 
     const isNewer = compareVersions(latest.version, APP_VERSION) > 0
     if (!isNewer) return
+
+    /*
+     * ⚠️ Guardado para o `update-downloaded`: é lá que se decide reiniciar
+     * sozinho, e naquele momento a resposta do Hub já passou. Sem isto, uma
+     * versão crítica ficaria esperando alguém clicar na bandeja — que foi o
+     * que deixou a RDF 5 dias numa versão com defeito conhecido.
+     */
+    atualizacaoObrigatoria = Boolean(latest.is_required)
 
     if (latest.is_required) {
       const { response } = await dialog.showMessageBox({

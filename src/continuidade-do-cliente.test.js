@@ -417,6 +417,62 @@ teste('🚨 a conferência da fila falha ABERTA (lpstat ruim não acusa nada)', 
   assert.ok(/catch \(_\) \{[\s\S]{0,160}return/.test(trecho), 'falha do lpstat tem de voltar sem acusar');
 });
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 A VERSÃO CRÍTICA SE INSTALA SOZINHA (31/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * A instalação esperava alguém FECHAR o app, e PC de expedição fica semanas
+ * aberto: a RDF ficou 5 dias na 1.0.14 com a 1.0.15 declarada e baixada.
+ */
+
+teste('🚨 o download CRÍTICO dispara a tentativa de reinício', () => {
+  assert.ok(
+    /update-downloaded'[\s\S]{0,400}tentarReinicioAutomatico\(\)/.test(main),
+    'baixar e esperar alguém clicar é o defeito que isto conserta',
+  );
+});
+
+teste('🚨 a decisão de reiniciar é a REGRA PURA, com as duas guardas', () => {
+  assert.ok(main.includes('decidirReinicio({'), 'a decisão saiu do módulo testado');
+  assert.ok(main.includes('imprimindo: filaDeImpressao.ocupada()'), 'não consulta a impressão');
+  assert.ok(
+    /acksPendentes: pendentesDeAck/.test(main),
+    'não consulta os ACKs — reiniciar com ACK na mão faz o pull reimprimir',
+  );
+});
+
+teste('🚨 `ocupada()` e não `pendentes()` (o lote em voo já saiu da espera)', () => {
+  assert.ok(
+    !/imprimindo: [^\n]*pendentes\(\)/.test(main),
+    'pendentes() não vê o lote que está imprimindo — diria "livre" no pior momento',
+  );
+});
+
+teste('⚠️ ACK pendente é RESOLVIDO, não só reportado', () => {
+  assert.ok(
+    /motivo === 'acks_pendentes'[\s\S]{0,80}enviarAcksPendentes\(\)/.test(main),
+    'sem isto a máquina nunca sai do estado de ACK pendente',
+  );
+});
+
+teste('⚠️ enquanto ocupado, REAVALIA — não desiste na primeira tentativa', () => {
+  // A expedição imprime em rajadas: a janela ociosa chega, mas não na hora.
+  assert.ok(
+    main.includes('setInterval(() => void avaliarReinicio(), INTERVALO_DE_TENTATIVA_MS)'),
+    'sem reavaliação, máquina ocupada nunca se atualiza',
+  );
+  // E para de reavaliar quando não há mais o que esperar.
+  assert.ok(
+    /motivo === 'nao_obrigatoria' \|\| motivo === 'sem_download'[\s\S]{0,120}clearInterval/.test(main),
+    'o laço ficaria rodando para sempre numa versão não obrigatória',
+  );
+});
+
+teste('🚨 o registro é GRAVADO antes de reiniciar', () => {
+  const i = main.indexOf('registroDeImpressao.salvar()\n  if (autoUpdater) autoUpdater.quitAndInstall');
+  assert.ok(i > 0, 'reiniciar sem gravar perde a prova de que o papel saiu');
+});
+
 for (const [nome, fn] of casos) {
   try { fn(); passaram++; console.log(`  ✓ ${nome}`); }
   catch (erro) { console.error(`  ✗ ${nome}\n    ${erro.message}`); process.exitCode = 1; }

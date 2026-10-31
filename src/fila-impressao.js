@@ -186,6 +186,23 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
   return {
     enfileirar,
     chaveDoDestino,
+    /**
+     * Há trabalho em curso? (pendente OU já no lote que está imprimindo)
+     *
+     * ⚠️ `pendentes()` NÃO serve para isso: ele conta só a fila de espera, e
+     * o lote em voo já saiu dela pelo `splice`. Quem sabe o conjunto inteiro
+     * é o `emCurso`, que só libera no DESFECHO. A diferença decide se o
+     * cliente pode se reiniciar para atualizar — e reiniciar no meio de um
+     * lote custa etiquetas, que não têm desfazer.
+     */
+    ocupada: () => {
+      for (const fila of filas.values()) {
+        if (fila.pendentes.length) return true;
+        if (fila.emCurso && fila.emCurso.size) return true;
+      }
+      return false;
+    },
+
     /** Só para teste e diagnóstico: quantos jobs esperam em cada destino. */
     pendentes: () => {
       const fora = {};

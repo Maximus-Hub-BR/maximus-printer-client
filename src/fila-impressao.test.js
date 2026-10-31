@@ -248,6 +248,32 @@ teste('🚨 job que FALHOU libera o uuid (preso seria PERDA, pior que duplicata)
   );
 });
 
+/*
+ * `ocupada()` — é o que decide se o cliente pode se reiniciar para instalar
+ * uma versão crítica. Reiniciar no meio de um lote custa etiquetas.
+ */
+
+teste('🚨 ocupada() enxerga o lote EM VOO, não só a fila de espera', async () => {
+  const { fila } = montar({ duracaoMs: 40 });
+  assert.strictEqual(fila.ocupada(), false, 'começa livre');
+  const p = fila.enfileirar(job('a'), 9);
+  // Agora o job saiu de `pendentes` pelo splice e está imprimindo: se
+  // `ocupada` olhasse só a fila de espera, diria "livre" no pior momento.
+  assert.strictEqual(fila.ocupada(), true, 'imprimindo tem de contar como ocupada');
+  await p;
+  await pausa(30);
+  assert.strictEqual(fila.ocupada(), false, 'terminou, pode reiniciar');
+});
+
+teste('⚠️ ocupada() volta a false mesmo quando o job FALHA', async () => {
+  // Senão uma falha deixaria a máquina marcada como ocupada para sempre e
+  // ela nunca mais se atualizaria.
+  const { fila } = montar({ falhar: () => true });
+  await fila.enfileirar(job('b'), 9);
+  await pausa(30);
+  assert.strictEqual(fila.ocupada(), false);
+});
+
 for (const [nome, fn] of casos) {
     try {
       await fn();
