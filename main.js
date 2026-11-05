@@ -419,6 +419,15 @@ const {
   interpretarLpstat,
   argumentosDeEstadoDaFila,
   filaEstaPausada,
+  idDoTrabalhoDoLp,
+  argumentosDeCancelamento,
+  argumentosDeRetomada,
+  filaReportaProblema,
+  argumentosDeTrabalhosPendentes,
+  trabalhoAindaNaFila,
+  ehFalhaDeEntrega,
+  TETO_DA_ESPERA_MS,
+  PASSO_DA_ESPERA_MS,
 } = require('./src/impressao-cups')
 
 /**
@@ -1024,10 +1033,21 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
   }
 }
 
-function entregarAoCups (args, impressora = null) {
+function entregarAoCups (args, impressora = null, jaRetomou = false) {
   const { execFileSync } = require('child_process')
+  let idDoTrabalho = null
   try {
-    execFileSync('lp', args, { timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] })
+    /*
+     * ⚠️ A saída do `lp` deixou de ser descartada: é dela que sai o id do
+     * trabalho (`<fila>-<n>`), e é esse id que permite cancelar APENAS o que
+     * acabamos de criar quando a fila está pausada. Sem ele, a única opção
+     * seria `cancel -a` — que derruba o trabalho dos outros operadores.
+     */
+    const saida = execFileSync('lp', args, {
+      timeout: 20000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    idDoTrabalho = idDoTrabalhoDoLp(saida && saida.toString())
   } catch (e) {
     const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
     throw new Error(`CUPS recusou o trabalho (${args.join(' ')}): ${detalhe.slice(0, 300)}`)
@@ -1064,13 +1084,126 @@ function entregarAoCups (args, impressora = null) {
     // Falha do próprio `lpstat` não acusa nada (falha ABERTA).
     return
   }
-  if (pausada) {
-    registrar(`[cups] ${impressora}: a FILA ESTÁ PAUSADA — o trabalho entrou mas não vai sair`)
+  if (!pausada) return confirmarQueSaiuDaFila(impressora, idDoTrabalho)
+
+  registrar(`[cups] ${impressora}: a FILA ESTÁ PAUSADA — o trabalho entrou mas não vai sair`)
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   * RETOMAR — cancelando só o PRÓPRIO trabalho (ver `impressao-cups.js`)
+   * ══════════════════════════════════════════════════════════════════════
+   * A ordem importa: cancela ANTES de retomar. Ao contrário, a fila volta a
+   * andar com o nosso trabalho ainda dentro e ele sai — e aí, se a segunda
+   * tentativa também sair, imprime DUAS vezes. Cancelar primeiro é o que
+   * torna a duplicidade impossível, não improvável.
+   *
+   * ⚠️ `jaRetomou` garante UMA tentativa, nunca um laço: fila que pausa de
+   * novo tem causa real (papel, cabo) e aí o erro tem de chegar a quem
+   * opera.
+   */
+  if (jaRetomou) {
+    throw new Error(
+      `A fila de impressão "${impressora}" voltou a pausar logo após ser retomada: ` +
+        'verifique papel, ribbon e cabo da impressora. A etiqueta NÃO foi impressa.',
+    )
+  }
+
+  if (idDoTrabalho) {
+    try {
+      execFileSync('cancel', argumentosDeCancelamento(idDoTrabalho), { timeout: 8000 })
+      registrar(`[cups] ${impressora}: trabalho ${idDoTrabalho} cancelado (não havia saído)`)
+    } catch (e) {
+      // Não conseguiu cancelar: NÃO retoma. Retomar aqui soltaria o nosso
+      // trabalho junto, e a segunda tentativa duplicaria o papel.
+      throw new Error(
+        `A fila "${impressora}" está pausada e não consegui cancelar o trabalho ` +
+          `${idDoTrabalho} (${String(e.message).slice(0, 120)}). Retome a impressora à mão.`,
+      )
+    }
+  } else {
+    /*
+     * ⚠️ Sem id não dá para cancelar só o nosso, e `cancel -a` derrubaria o
+     * dos outros. Aqui o certo é parar: erro honesto, como era antes.
+     */
     throw new Error(
       `A fila de impressão "${impressora}" está pausada no sistema: o trabalho foi aceito ` +
         'mas não será impresso. Retome a impressora e mande de novo.',
     )
   }
+
+  try {
+    execFileSync('cupsenable', argumentosDeRetomada(impressora), { timeout: 8000 })
+    registrar(`[cups] ${impressora}: fila RETOMADA automaticamente`)
+  } catch (e) {
+    throw new Error(
+      `A fila de impressão "${impressora}" está pausada e não consegui retomá-la ` +
+        `(${String(e.message).slice(0, 120)}). Retome à mão e mande de novo.`,
+    )
+  }
+
+  // Agora sim: a MESMA entrega, uma vez só, com a fila ativa.
+  registrar(`[cups] ${impressora}: reenviando o trabalho depois da retomada`)
+  return entregarAoCups(args, impressora, true)
+}
+
+/**
+ * Espera o trabalho SAIR da fila e acusa quando ele não sai porque a
+ * impressora não responde — ver o cabeçalho em `impressao-cups.js`.
+ *
+ * ⚠️ **Teto, não espera fixa.** Sonda de `PASSO_DA_ESPERA_MS` em
+ * `PASSO_DA_ESPERA_MS` e volta no instante em que o trabalho some. Medido em
+ * 04/11/2026 numa GC420t por USB: a fila esvazia em 0 s, então no caso
+ * normal isto custa UMA sondagem. Os 3 s só aparecem quando há algo errado.
+ *
+ * ⚠️ **Falha ABERTA** em todo caminho que não entendemos: sem id, `lpstat`
+ * que não roda ou frase desconhecida não acusam nada.
+ */
+function confirmarQueSaiuDaFila (impressora, idDoTrabalho) {
+  if (!impressora || !idDoTrabalho) return
+  const { execFileSync } = require('child_process')
+  const ate = Date.now() + TETO_DA_ESPERA_MS
+  let pendentes = ''
+  for (;;) {
+    try {
+      pendentes = execFileSync('lpstat', argumentosDeTrabalhosPendentes(impressora), {
+        timeout: 8000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).toString()
+    } catch (_) {
+      // `lpstat` sem trabalhos pendentes sai com código != 0 em alguns
+      // sistemas: isso é "a fila está vazia", não erro.
+      pendentes = ''
+    }
+    if (!trabalhoAindaNaFila(pendentes, idDoTrabalho)) return
+    if (Date.now() >= ate) break
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, PASSO_DA_ESPERA_MS)
+  }
+
+  let estado = ''
+  try {
+    estado = execFileSync('lpstat', argumentosDeEstadoDaFila(impressora), {
+      timeout: 8000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).toString()
+  } catch (_) {
+    return // não sei o estado: não acuso (falha ABERTA)
+  }
+
+  /*
+   * 🚨 As DUAS condições. Fila apenas ocupada (trabalho na fila, impressora
+   * saudável) NÃO é falha: acusar ali faria o operador reimprimir e o papel
+   * sairia em dobro.
+   */
+  if (!ehFalhaDeEntrega(true, filaReportaProblema(estado))) {
+    registrar(`[cups] ${impressora}: trabalho ${idDoTrabalho} ainda na fila, mas a fila está saudável — seguindo`)
+    return
+  }
+
+  registrar(`[cups] ${impressora}: a impressora NÃO RESPONDE e ${idDoTrabalho} não saiu da fila`)
+  throw new Error(
+    `A impressora "${impressora}" não está respondendo: o trabalho foi aceito pelo sistema ` +
+      'mas não chegou a imprimir. Verifique se ela está ligada e acessível na rede.',
+  )
 }
 
 /**
