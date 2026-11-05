@@ -14,6 +14,13 @@ const {
   interpretarLpstat,
   argumentosDeEstadoDaFila,
   filaEstaPausada,
+  idDoTrabalhoDoLp,
+  argumentosDeCancelamento,
+  argumentosDeRetomada,
+  filaReportaProblema,
+  argumentosDeTrabalhosPendentes,
+  trabalhoAindaNaFila,
+  ehFalhaDeEntrega,
 } = require('./impressao-cups')
 
 let passaram = 0
@@ -139,6 +146,157 @@ teste('⚠️ o nome vai como ARGUMENTO, nunca dentro de uma string de shell', (
   assert.strictEqual(args.length, 2)
   assert.strictEqual(args[1], 'Zebra "do balcão" 2')
   for (const a of args) assert.ok(!a.includes('&&') && !a.includes(';'))
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Retomar a fila pausada — ver o cabeçalho em `impressao-cups.js`
+// ═══════════════════════════════════════════════════════════════════════════
+
+/*
+ * ⚠️ A saída do `lp` é TRADUZIDA. Nesta máquina (Mac em pt-BR) ela é
+ * "id solicitado é <fila>-<n> (1 arquivo(s))" — medido em 04/11/2026. Casar
+ * a frase em inglês devolveria null aqui, o cancelamento seria pulado e o
+ * trabalho ficaria preso: a mesma armadilha que o `lpstat` já pregou.
+ */
+teste('o id sai da saída do lp em PORTUGUÊS', () => {
+  assert.strictEqual(
+    idDoTrabalhoDoLp('id solicitado é Zebra_GC420t-402 (1 arquivo(s))'),
+    'Zebra_GC420t-402',
+  )
+})
+
+teste('o id sai da saída do lp em inglês', () => {
+  assert.strictEqual(
+    idDoTrabalhoDoLp('request id is ZebraVirtual_Teste-7 (1 file(s))'),
+    'ZebraVirtual_Teste-7',
+  )
+})
+
+teste('nome de fila com ponto, underscore e hífen continua casando', () => {
+  assert.strictEqual(
+    idDoTrabalhoDoLp('request id is HP_Color.LaserJet-Pro_4203-19 (1 file(s))'),
+    'HP_Color.LaserJet-Pro_4203-19',
+  )
+})
+
+/*
+ * 🚨 `null` é o que PROTEGE: sem id reconhecido o chamador PULA o
+ * cancelamento. A alternativa seria `cancel -a`, que derruba o trabalho dos
+ * outros operadores daquela fila — exatamente a duplicidade/perda que este
+ * mecanismo existe para impedir.
+ */
+teste('saída que não reconhece devolve null (e o cancelamento é pulado)', () => {
+  assert.strictEqual(idDoTrabalhoDoLp('qualquer coisa'), null)
+  assert.strictEqual(idDoTrabalhoDoLp(''), null)
+  assert.strictEqual(idDoTrabalhoDoLp(null), null)
+  assert.strictEqual(idDoTrabalhoDoLp(undefined), null)
+})
+
+teste('cancelamento é de UM trabalho, nunca com -a', () => {
+  const args = argumentosDeCancelamento('Zebra_GC420t-402')
+  assert.deepStrictEqual(args, ['Zebra_GC420t-402'])
+  assert.ok(!args.includes('-a'), '`-a` cancelaria o trabalho de outro operador')
+})
+
+teste('a retomada nomeia a fila', () => {
+  assert.deepStrictEqual(argumentosDeRetomada('Zebra_GC420t'), ['Zebra_GC420t'])
+})
+
+/*
+ * O par que fecha o ciclo: a MESMA saída de `lpstat` que acusa a pausa tem
+ * de deixar de acusar depois da retomada. Sem isso o cliente reenviaria para
+ * uma fila ainda parada e o trabalho ficaria preso de novo.
+ */
+teste('lpstat de fila retomada não acusa pausa', () => {
+  assert.strictEqual(
+    filaEstaPausada('impressora Zebra_GC420t desativada desde Wed Nov 4 20:40:10 2026 -'),
+    true,
+  )
+  assert.strictEqual(
+    filaEstaPausada('impressora Zebra_GC420t está ociosa.  ativada desde Wed Nov 4 20:40:39 2026'),
+    false,
+  )
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Confirmar que o trabalho SAIU da fila (impressora que não responde)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/*
+ * O caso real medido em 04/11/2026: fila apontada para porta morta. Repare
+ * que a linha diz "ativada desde" — a fila NÃO está pausada, está tentando.
+ * Por isso `filaEstaPausada` não serve aqui e existe este par.
+ */
+const LPSTAT_NAO_RESPONDE =
+  'impressora FilaQuebrada agora está imprimindo FilaQuebrada-415.  ativada desde Wed Nov 4 21:13:13 2026\n' +
+  '\tA impressora não está respondendo.'
+
+teste('fila que não responde é detectada mesmo ATIVA', () => {
+  assert.strictEqual(filaReportaProblema(LPSTAT_NAO_RESPONDE), true)
+  assert.strictEqual(filaEstaPausada(LPSTAT_NAO_RESPONDE), false,
+    'esta fila NÃO está pausada — é por isso que o outro detector não a pega')
+})
+
+teste('a frase em inglês também é reconhecida', () => {
+  assert.strictEqual(
+    filaReportaProblema('printer X is busy\n\tThe printer is not responding.'), true)
+  assert.strictEqual(
+    filaReportaProblema('printer X\n\tWaiting for printer to become available.'), true)
+})
+
+/* ⚠️ Falha ABERTA: frase que não conhecemos NÃO acusa. */
+teste('estado normal e frase desconhecida não acusam nada', () => {
+  assert.strictEqual(
+    filaReportaProblema('impressora X está ociosa.  ativada desde Wed Nov 4'), false)
+  assert.strictEqual(filaReportaProblema('blá blá'), false)
+  assert.strictEqual(filaReportaProblema(''), false)
+  assert.strictEqual(filaReportaProblema(null), false)
+})
+
+teste('os pendentes são pedidos de UMA fila', () => {
+  assert.deepStrictEqual(argumentosDeTrabalhosPendentes('Zebra'), ['-o', 'Zebra'])
+})
+
+/*
+ * 🚨 O id é comparado INTEIRO: procurar como substring casaria `fila-41`
+ * dentro de `fila-415` e daria "ainda na fila" para um trabalho que já saiu.
+ */
+teste('o trabalho é achado pelo id inteiro, nunca por substring', () => {
+  const saida = 'Zebra-415 leonardo 148480 Wed Nov 4 20:39:37 2026'
+  assert.strictEqual(trabalhoAindaNaFila(saida, 'Zebra-415'), true)
+  assert.strictEqual(trabalhoAindaNaFila(saida, 'Zebra-41'), false)
+  assert.strictEqual(trabalhoAindaNaFila(saida, 'Zebra-4'), false)
+})
+
+teste('fila vazia significa que o trabalho saiu', () => {
+  assert.strictEqual(trabalhoAindaNaFila('', 'Zebra-415'), false)
+  assert.strictEqual(trabalhoAindaNaFila(null, 'Zebra-415'), false)
+})
+
+teste('sem id não se afirma nada sobre a fila', () => {
+  assert.strictEqual(trabalhoAindaNaFila('Zebra-415 leonardo', null), false)
+})
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════
+ * 🚨 A REGRA QUE IMPEDE A DUPLICATA
+ * ═══════════════════════════════════════════════════════════════════════
+ * Impressora OCUPADA tem trabalho na fila e está perfeitamente saudável.
+ * Marcar erro aí faria o operador reimprimir e o papel sairia EM DOBRO —
+ * pior que o defeito que esta função conserta, porque duplicata não tem
+ * desfazer. Por isso as duas condições têm de valer juntas.
+ */
+teste('fila ocupada mas SAUDÁVEL não é falha (senão duplicaria)', () => {
+  assert.strictEqual(ehFalhaDeEntrega(true, false), false)
+})
+
+teste('fila com problema mas trabalho JÁ SAIU não é falha', () => {
+  assert.strictEqual(ehFalhaDeEntrega(false, true), false)
+})
+
+teste('só é falha quando o trabalho ficou E a fila acusa problema', () => {
+  assert.strictEqual(ehFalhaDeEntrega(true, true), true)
+  assert.strictEqual(ehFalhaDeEntrega(false, false), false)
 })
 
 for (const [nome, fn] of casos) {
