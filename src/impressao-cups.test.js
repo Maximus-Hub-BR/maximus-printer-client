@@ -14,6 +14,9 @@ const {
   interpretarLpstat,
   argumentosDeEstadoDaFila,
   filaEstaPausada,
+  idDoTrabalhoDoLp,
+  argumentosDeCancelamento,
+  argumentosDeRetomada,
 } = require('./impressao-cups')
 
 let passaram = 0
@@ -139,6 +142,76 @@ teste('⚠️ o nome vai como ARGUMENTO, nunca dentro de uma string de shell', (
   assert.strictEqual(args.length, 2)
   assert.strictEqual(args[1], 'Zebra "do balcão" 2')
   for (const a of args) assert.ok(!a.includes('&&') && !a.includes(';'))
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Retomar a fila pausada — ver o cabeçalho em `impressao-cups.js`
+// ═══════════════════════════════════════════════════════════════════════════
+
+/*
+ * ⚠️ A saída do `lp` é TRADUZIDA. Nesta máquina (Mac em pt-BR) ela é
+ * "id solicitado é <fila>-<n> (1 arquivo(s))" — medido em 04/11/2026. Casar
+ * a frase em inglês devolveria null aqui, o cancelamento seria pulado e o
+ * trabalho ficaria preso: a mesma armadilha que o `lpstat` já pregou.
+ */
+teste('o id sai da saída do lp em PORTUGUÊS', () => {
+  assert.strictEqual(
+    idDoTrabalhoDoLp('id solicitado é Zebra_GC420t-402 (1 arquivo(s))'),
+    'Zebra_GC420t-402',
+  )
+})
+
+teste('o id sai da saída do lp em inglês', () => {
+  assert.strictEqual(
+    idDoTrabalhoDoLp('request id is ZebraVirtual_Teste-7 (1 file(s))'),
+    'ZebraVirtual_Teste-7',
+  )
+})
+
+teste('nome de fila com ponto, underscore e hífen continua casando', () => {
+  assert.strictEqual(
+    idDoTrabalhoDoLp('request id is HP_Color.LaserJet-Pro_4203-19 (1 file(s))'),
+    'HP_Color.LaserJet-Pro_4203-19',
+  )
+})
+
+/*
+ * 🚨 `null` é o que PROTEGE: sem id reconhecido o chamador PULA o
+ * cancelamento. A alternativa seria `cancel -a`, que derruba o trabalho dos
+ * outros operadores daquela fila — exatamente a duplicidade/perda que este
+ * mecanismo existe para impedir.
+ */
+teste('saída que não reconhece devolve null (e o cancelamento é pulado)', () => {
+  assert.strictEqual(idDoTrabalhoDoLp('qualquer coisa'), null)
+  assert.strictEqual(idDoTrabalhoDoLp(''), null)
+  assert.strictEqual(idDoTrabalhoDoLp(null), null)
+  assert.strictEqual(idDoTrabalhoDoLp(undefined), null)
+})
+
+teste('cancelamento é de UM trabalho, nunca com -a', () => {
+  const args = argumentosDeCancelamento('Zebra_GC420t-402')
+  assert.deepStrictEqual(args, ['Zebra_GC420t-402'])
+  assert.ok(!args.includes('-a'), '`-a` cancelaria o trabalho de outro operador')
+})
+
+teste('a retomada nomeia a fila', () => {
+  assert.deepStrictEqual(argumentosDeRetomada('Zebra_GC420t'), ['Zebra_GC420t'])
+})
+
+/*
+ * O par que fecha o ciclo: a MESMA saída de `lpstat` que acusa a pausa tem
+ * de deixar de acusar depois da retomada. Sem isso o cliente reenviaria para
+ * uma fila ainda parada e o trabalho ficaria preso de novo.
+ */
+teste('lpstat de fila retomada não acusa pausa', () => {
+  assert.strictEqual(
+    filaEstaPausada('impressora Zebra_GC420t desativada desde Wed Nov 4 20:40:10 2026 -'),
+    true,
+  )
+  assert.strictEqual(
+    filaEstaPausada('impressora Zebra_GC420t está ociosa.  ativada desde Wed Nov 4 20:40:39 2026'),
+    false,
+  )
 })
 
 for (const [nome, fn] of casos) {

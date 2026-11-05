@@ -419,6 +419,9 @@ const {
   interpretarLpstat,
   argumentosDeEstadoDaFila,
   filaEstaPausada,
+  idDoTrabalhoDoLp,
+  argumentosDeCancelamento,
+  argumentosDeRetomada,
 } = require('./src/impressao-cups')
 
 /**
@@ -1024,10 +1027,21 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
   }
 }
 
-function entregarAoCups (args, impressora = null) {
+function entregarAoCups (args, impressora = null, jaRetomou = false) {
   const { execFileSync } = require('child_process')
+  let idDoTrabalho = null
   try {
-    execFileSync('lp', args, { timeout: 20000, stdio: ['ignore', 'pipe', 'pipe'] })
+    /*
+     * ⚠️ A saída do `lp` deixou de ser descartada: é dela que sai o id do
+     * trabalho (`<fila>-<n>`), e é esse id que permite cancelar APENAS o que
+     * acabamos de criar quando a fila está pausada. Sem ele, a única opção
+     * seria `cancel -a` — que derruba o trabalho dos outros operadores.
+     */
+    const saida = execFileSync('lp', args, {
+      timeout: 20000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    idDoTrabalho = idDoTrabalhoDoLp(saida && saida.toString())
   } catch (e) {
     const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
     throw new Error(`CUPS recusou o trabalho (${args.join(' ')}): ${detalhe.slice(0, 300)}`)
@@ -1064,13 +1078,66 @@ function entregarAoCups (args, impressora = null) {
     // Falha do próprio `lpstat` não acusa nada (falha ABERTA).
     return
   }
-  if (pausada) {
-    registrar(`[cups] ${impressora}: a FILA ESTÁ PAUSADA — o trabalho entrou mas não vai sair`)
+  if (!pausada) return
+
+  registrar(`[cups] ${impressora}: a FILA ESTÁ PAUSADA — o trabalho entrou mas não vai sair`)
+
+  /*
+   * ══════════════════════════════════════════════════════════════════════
+   * RETOMAR — cancelando só o PRÓPRIO trabalho (ver `impressao-cups.js`)
+   * ══════════════════════════════════════════════════════════════════════
+   * A ordem importa: cancela ANTES de retomar. Ao contrário, a fila volta a
+   * andar com o nosso trabalho ainda dentro e ele sai — e aí, se a segunda
+   * tentativa também sair, imprime DUAS vezes. Cancelar primeiro é o que
+   * torna a duplicidade impossível, não improvável.
+   *
+   * ⚠️ `jaRetomou` garante UMA tentativa, nunca um laço: fila que pausa de
+   * novo tem causa real (papel, cabo) e aí o erro tem de chegar a quem
+   * opera.
+   */
+  if (jaRetomou) {
+    throw new Error(
+      `A fila de impressão "${impressora}" voltou a pausar logo após ser retomada: ` +
+        'verifique papel, ribbon e cabo da impressora. A etiqueta NÃO foi impressa.',
+    )
+  }
+
+  if (idDoTrabalho) {
+    try {
+      execFileSync('cancel', argumentosDeCancelamento(idDoTrabalho), { timeout: 8000 })
+      registrar(`[cups] ${impressora}: trabalho ${idDoTrabalho} cancelado (não havia saído)`)
+    } catch (e) {
+      // Não conseguiu cancelar: NÃO retoma. Retomar aqui soltaria o nosso
+      // trabalho junto, e a segunda tentativa duplicaria o papel.
+      throw new Error(
+        `A fila "${impressora}" está pausada e não consegui cancelar o trabalho ` +
+          `${idDoTrabalho} (${String(e.message).slice(0, 120)}). Retome a impressora à mão.`,
+      )
+    }
+  } else {
+    /*
+     * ⚠️ Sem id não dá para cancelar só o nosso, e `cancel -a` derrubaria o
+     * dos outros. Aqui o certo é parar: erro honesto, como era antes.
+     */
     throw new Error(
       `A fila de impressão "${impressora}" está pausada no sistema: o trabalho foi aceito ` +
         'mas não será impresso. Retome a impressora e mande de novo.',
     )
   }
+
+  try {
+    execFileSync('cupsenable', argumentosDeRetomada(impressora), { timeout: 8000 })
+    registrar(`[cups] ${impressora}: fila RETOMADA automaticamente`)
+  } catch (e) {
+    throw new Error(
+      `A fila de impressão "${impressora}" está pausada e não consegui retomá-la ` +
+        `(${String(e.message).slice(0, 120)}). Retome à mão e mande de novo.`,
+    )
+  }
+
+  // Agora sim: a MESMA entrega, uma vez só, com a fila ativa.
+  registrar(`[cups] ${impressora}: reenviando o trabalho depois da retomada`)
+  return entregarAoCups(args, impressora, true)
 }
 
 /**

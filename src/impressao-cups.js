@@ -108,6 +108,83 @@ function filaEstaPausada (saidaDoLpstat) {
   return /\bdesativada\b/i.test(texto) || /\bdisabled\b/i.test(texto)
 }
 
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * RETOMAR A FILA PAUSADA — sem duplicar e sem perder (04/11/2026)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Até aqui, fila pausada virava erro honesto e parava por ali: *"Retome a
+ * impressora e mande de novo"*. Funciona, mas joga para quem opera um
+ * problema que a máquina sabe resolver — e no incidente de 31/10/2026 isso
+ * custou 5 ondas de 21 etiquetas paradas sem ninguém entender por quê.
+ *
+ * O pedido do dono foi explícito: transparente para quem usa, com **certeza
+ * de zero duplicidade e zero perda**. As duas saídas óbvias falham nisso:
+ *
+ *   · cancelar tudo que está preso → não duplica, mas PERDE o que o Hub já
+ *     contou como impresso;
+ *   · retomar e deixar sair tudo → não perde, mas DUPLICA o que a operadora
+ *     já reimprimiu à mão (o cenário real de 31/10).
+ *
+ * 🚨 **A saída é não tocar no que é dos outros.** O `lp` devolve o id do
+ * trabalho que ACABOU de criar — e era essa saída que a gente jogava fora.
+ * Com o id em mãos, a sequência cancela **só o próprio trabalho**, que
+ * comprovadamente não saiu, retoma a fila e tenta UMA vez:
+ *
+ *     id = idDoTrabalhoDoLp(saída do lp)
+ *     se a fila está pausada:
+ *         cancel <id>        ← só o meu, nunca o de outro
+ *         cupsenable <fila>
+ *         reconfere e reenvia UMA vez
+ *
+ * Zero duplicidade porque o único trabalho cancelado é o que eu criei e que
+ * não imprimiu. Zero perda porque, se a segunda tentativa também falhar, o
+ * erro sobe, o Hub grava `error`, o `print_count` não é incrementado e o
+ * pedido **volta para a aba** — medido em 04/11/2026 com a fila pausada de
+ * propósito.
+ *
+ * ⚠️ E o efeito colateral que importa: a partir daqui **deixa de existir**
+ * "fila pausada com trabalho preso", porque todo trabalho que encontra a
+ * fila pausada é cancelado no mesmo instante. A janela some; sobra só a
+ * limpeza única dos trabalhos legados.
+ */
+
+/**
+ * O id do trabalho que o `lp` acabou de criar, lido do stdout dele.
+ *
+ * O `lp` responde `request id is <fila>-<n> (1 file(s))` — e em português
+ * `id solicitado é <fila>-<n> (1 arquivo(s))`. Por isso o padrão casa a
+ * FORMA do id (`fila-número` antes do parêntese), não a frase: procurar o
+ * texto em inglês devolve `null` num Mac em português, exatamente como o
+ * `lpstat` já ensinou aqui.
+ *
+ * ⚠️ `null` quando não reconhece — e aí o cancelamento é PULADO. Cancelar
+ * sem saber o id significaria `cancel -a`, que derruba trabalho dos outros:
+ * é o oposto da garantia que esta função existe para dar.
+ */
+function idDoTrabalhoDoLp (saidaDoLp) {
+  const texto = String(saidaDoLp || '')
+  const achado = texto.match(/([A-Za-z0-9_.:@-]+-\d+)\s*\(/)
+  return achado ? achado[1] : null
+}
+
+/** Argumentos do `cancel` para UM trabalho — nunca `-a`. */
+function argumentosDeCancelamento (idDoTrabalho) {
+  return [String(idDoTrabalho)]
+}
+
+/**
+ * Argumentos do `cupsenable` para retomar a fila.
+ *
+ * ⚠️ `cupsenable` retoma a IMPRESSÃO; `cupsaccept` retoma o ACEITE de novos
+ * trabalhos. São coisas diferentes e o sintoma de 31/10 é o primeiro: o
+ * `lp` era aceito (logo, o aceite estava ligado) e nada saía.
+ */
+function argumentosDeRetomada (impressora) {
+  return [String(impressora)]
+}
+
 module.exports = {
   canalDePdf,
   argumentosDeEstadoDaFila,
@@ -116,4 +193,7 @@ module.exports = {
   argumentosDePdf,
   argumentosDeZplRaw,
   interpretarLpstat,
+  idDoTrabalhoDoLp,
+  argumentosDeCancelamento,
+  argumentosDeRetomada,
 }
