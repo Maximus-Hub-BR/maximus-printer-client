@@ -17,6 +17,10 @@ const {
   idDoTrabalhoDoLp,
   argumentosDeCancelamento,
   argumentosDeRetomada,
+  filaReportaProblema,
+  argumentosDeTrabalhosPendentes,
+  trabalhoAindaNaFila,
+  ehFalhaDeEntrega,
 } = require('./impressao-cups')
 
 let passaram = 0
@@ -212,6 +216,87 @@ teste('lpstat de fila retomada não acusa pausa', () => {
     filaEstaPausada('impressora Zebra_GC420t está ociosa.  ativada desde Wed Nov 4 20:40:39 2026'),
     false,
   )
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Confirmar que o trabalho SAIU da fila (impressora que não responde)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/*
+ * O caso real medido em 04/11/2026: fila apontada para porta morta. Repare
+ * que a linha diz "ativada desde" — a fila NÃO está pausada, está tentando.
+ * Por isso `filaEstaPausada` não serve aqui e existe este par.
+ */
+const LPSTAT_NAO_RESPONDE =
+  'impressora FilaQuebrada agora está imprimindo FilaQuebrada-415.  ativada desde Wed Nov 4 21:13:13 2026\n' +
+  '\tA impressora não está respondendo.'
+
+teste('fila que não responde é detectada mesmo ATIVA', () => {
+  assert.strictEqual(filaReportaProblema(LPSTAT_NAO_RESPONDE), true)
+  assert.strictEqual(filaEstaPausada(LPSTAT_NAO_RESPONDE), false,
+    'esta fila NÃO está pausada — é por isso que o outro detector não a pega')
+})
+
+teste('a frase em inglês também é reconhecida', () => {
+  assert.strictEqual(
+    filaReportaProblema('printer X is busy\n\tThe printer is not responding.'), true)
+  assert.strictEqual(
+    filaReportaProblema('printer X\n\tWaiting for printer to become available.'), true)
+})
+
+/* ⚠️ Falha ABERTA: frase que não conhecemos NÃO acusa. */
+teste('estado normal e frase desconhecida não acusam nada', () => {
+  assert.strictEqual(
+    filaReportaProblema('impressora X está ociosa.  ativada desde Wed Nov 4'), false)
+  assert.strictEqual(filaReportaProblema('blá blá'), false)
+  assert.strictEqual(filaReportaProblema(''), false)
+  assert.strictEqual(filaReportaProblema(null), false)
+})
+
+teste('os pendentes são pedidos de UMA fila', () => {
+  assert.deepStrictEqual(argumentosDeTrabalhosPendentes('Zebra'), ['-o', 'Zebra'])
+})
+
+/*
+ * 🚨 O id é comparado INTEIRO: procurar como substring casaria `fila-41`
+ * dentro de `fila-415` e daria "ainda na fila" para um trabalho que já saiu.
+ */
+teste('o trabalho é achado pelo id inteiro, nunca por substring', () => {
+  const saida = 'Zebra-415 leonardo 148480 Wed Nov 4 20:39:37 2026'
+  assert.strictEqual(trabalhoAindaNaFila(saida, 'Zebra-415'), true)
+  assert.strictEqual(trabalhoAindaNaFila(saida, 'Zebra-41'), false)
+  assert.strictEqual(trabalhoAindaNaFila(saida, 'Zebra-4'), false)
+})
+
+teste('fila vazia significa que o trabalho saiu', () => {
+  assert.strictEqual(trabalhoAindaNaFila('', 'Zebra-415'), false)
+  assert.strictEqual(trabalhoAindaNaFila(null, 'Zebra-415'), false)
+})
+
+teste('sem id não se afirma nada sobre a fila', () => {
+  assert.strictEqual(trabalhoAindaNaFila('Zebra-415 leonardo', null), false)
+})
+
+/*
+ * ═══════════════════════════════════════════════════════════════════════
+ * 🚨 A REGRA QUE IMPEDE A DUPLICATA
+ * ═══════════════════════════════════════════════════════════════════════
+ * Impressora OCUPADA tem trabalho na fila e está perfeitamente saudável.
+ * Marcar erro aí faria o operador reimprimir e o papel sairia EM DOBRO —
+ * pior que o defeito que esta função conserta, porque duplicata não tem
+ * desfazer. Por isso as duas condições têm de valer juntas.
+ */
+teste('fila ocupada mas SAUDÁVEL não é falha (senão duplicaria)', () => {
+  assert.strictEqual(ehFalhaDeEntrega(true, false), false)
+})
+
+teste('fila com problema mas trabalho JÁ SAIU não é falha', () => {
+  assert.strictEqual(ehFalhaDeEntrega(false, true), false)
+})
+
+teste('só é falha quando o trabalho ficou E a fila acusa problema', () => {
+  assert.strictEqual(ehFalhaDeEntrega(true, true), true)
+  assert.strictEqual(ehFalhaDeEntrega(false, false), false)
 })
 
 for (const [nome, fn] of casos) {

@@ -185,6 +185,102 @@ function argumentosDeRetomada (impressora) {
   return [String(impressora)]
 }
 
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🚨 "ACEITO" TAMBÉM NÃO É "VAI SAIR" QUANDO A IMPRESSORA NÃO RESPONDE
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Medido em 04/11/2026, com uma fila apontada para uma porta onde ninguém
+ * escuta (o retrato de uma Zebra de rede desligada):
+ *
+ *     Hub:         status=success · ACK em 1 s · print_count 1 → 2
+ *     Impressora:  "A impressora não está respondendo" · 1 trabalho preso
+ *
+ * O Hub afirmou que imprimiu e o papel nunca saiu. É o mesmo estrago do
+ * incidente de 31/10/2026 por OUTRA porta: lá a fila PARAVA (`desativada`),
+ * aqui ela fica **ativa, tentando para sempre** — e por isso
+ * `filaEstaPausada` passa batido, já que a linha do `lpstat` diz
+ * "ativada desde …".
+ *
+ * ⚠️ **O alcance não é marginal**: medido na base, **31 das 33** impressoras
+ * compartilhadas vão pela fila do sistema, não por TCP direto. Toda Zebra de
+ * rede configurada como fila do SO está exposta.
+ *
+ * ── Por que a condição é CONJUNTA, e isso é o ponto ───────────────────────
+ * 🚨 Marcar erro só porque o trabalho continua na fila seria TROCAR um
+ * defeito por outro pior: impressora **ocupada** (lote grande saindo normal)
+ * viraria erro falso, o operador reimprimiria e o papel sairia **em dobro**.
+ * Mentir dizendo "falhou" custa mais caro que mentir dizendo "imprimiu",
+ * porque duplicata não tem desfazer.
+ *
+ * Então só é erro quando as DUAS coisas valem ao mesmo tempo: o trabalho
+ * ainda está na fila **e** a fila reporta problema. Fila andando devagar não
+ * dispara nada.
+ */
+
+/** Teto da espera pela saída do trabalho da fila (ms). */
+const TETO_DA_ESPERA_MS = 3000;
+
+/** Intervalo entre as sondagens — sai assim que o trabalho some. */
+const PASSO_DA_ESPERA_MS = 300;
+
+/**
+ * A fila reporta que a impressora não responde?
+ *
+ * ⚠️ As frases são TRADUZIDAS, como todas as do `lpstat` neste arquivo. Num
+ * Mac em português a linha é "A impressora não está respondendo."; em inglês,
+ * "The printer is not responding.". Há ainda a variante de espera
+ * ("Aguardando a impressora ficar disponível" / "Waiting for printer to
+ * become available"), que é o MESMO problema no estágio anterior.
+ *
+ * ⚠️ **Falha ABERTA**: frase desconhecida devolve `false` — não sabemos, logo
+ * não acusamos. É o que impede que um Mac num idioma que não prevemos comece
+ * a marcar etiqueta boa como falha.
+ */
+function filaReportaProblema (saidaDoLpstat) {
+  const texto = String(saidaDoLpstat || '')
+  if (!texto.trim()) return false
+  return (
+    /não está respondendo|nao esta respondendo/i.test(texto) ||
+    /is not responding/i.test(texto) ||
+    /aguardando a impressora/i.test(texto) ||
+    /waiting for printer/i.test(texto)
+  )
+}
+
+/**
+ * Argumentos do `lpstat` para listar os trabalhos PENDENTES de uma fila.
+ * `-o <fila>` lista só o que ainda não saiu — trabalho impresso some daqui.
+ */
+function argumentosDeTrabalhosPendentes (impressora) {
+  return ['-o', String(impressora)]
+}
+
+/**
+ * O trabalho `idDoTrabalho` ainda aparece na listagem de pendentes?
+ *
+ * ⚠️ Compara o id INTEIRO no começo da linha. O `lpstat -o` imprime
+ * `<fila>-<n> <dono> <tamanho> <data>`, e procurar o id como substring
+ * casaria `fila-41` dentro de `fila-415`.
+ */
+function trabalhoAindaNaFila (saidaDoLpstat, idDoTrabalho) {
+  if (!idDoTrabalho) return false
+  const alvo = String(idDoTrabalho)
+  return String(saidaDoLpstat || '')
+    .split('\n')
+    .some((linha) => linha.trim().split(/\s+/)[0] === alvo)
+}
+
+/**
+ * A decisão final, PURA: depois da espera, isto é falha de entrega?
+ *
+ * Só quando as duas valem — ver o cabeçalho acima.
+ */
+function ehFalhaDeEntrega (aindaNaFila, reportaProblema) {
+  return Boolean(aindaNaFila && reportaProblema)
+}
+
 module.exports = {
   canalDePdf,
   argumentosDeEstadoDaFila,
@@ -196,4 +292,10 @@ module.exports = {
   idDoTrabalhoDoLp,
   argumentosDeCancelamento,
   argumentosDeRetomada,
+  filaReportaProblema,
+  argumentosDeTrabalhosPendentes,
+  trabalhoAindaNaFila,
+  ehFalhaDeEntrega,
+  TETO_DA_ESPERA_MS,
+  PASSO_DA_ESPERA_MS,
 }
