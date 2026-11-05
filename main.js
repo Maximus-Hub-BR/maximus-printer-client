@@ -1270,11 +1270,60 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName, etiquetas = 1
         if (relogio) { clearTimeout(relogio); relogio = null }
         fn(arg)
       }
+      /*
+       * ═══════════════════════════════════════════════════════════════════
+       * 🚨 ESCRITA CONFIRMADA — o socket mentia igual ao ACK (04/11/2026)
+       * ═══════════════════════════════════════════════════════════════════
+       * Medido derrubando a conexão no meio de um bloco de 5 etiquetas:
+       *
+       *     enviado : 321.416 bytes · 5 etiquetas
+       *     chegou  :  65.536 bytes · 2 etiquetas   <- o buffer do SO, exato
+       *     Hub     : success · print_count +1 nas 5
+       *
+       * Três etiquetas sumiram sem uma linha de log. A causa são três
+       * descuidos no mesmo ponto: o callback do `write` era ignorado (ele é
+       * quem diz se os bytes saíram), o `end()` vinha antes de a escrita
+       * completar, e o `close` resolvia a promessa **mesmo com
+       * `hadError = true`** — ou seja, conexão derrubada virava sucesso.
+       *
+       * ⚠️ `write` devolve `false` quando o buffer do SO enche (foi o que
+       * aconteceu nos 64 KB): o resto fica pendente e só sai depois. Quem
+       * confirma é o CALLBACK, não o retorno.
+       *
+       * ⚠️ E a conferência final é `bytesWritten`, que o próprio socket
+       * conta: se ele não bate com o tamanho do buffer, alguma coisa não
+       * saiu — e aí é erro, não sucesso. Sem essa linha o ACK volta a
+       * afirmar o que não sabe.
+       */
+      let escritaConfirmada = false
       const socket = net.createConnection({ host: zplHost, port: zplPort }, () => {
-        socket.write(buffer)
-        socket.end()
+        socket.write(buffer, (erroDeEscrita) => {
+          if (erroDeEscrita) return encerrar(reject, erroDeEscrita)
+          escritaConfirmada = true
+          socket.end()
+        })
       })
-      socket.on('close', () => {
+      socket.on('close', (houveErro) => {
+        if (houveErro) {
+          registrar(
+            `[zpl] ${printerName} via ${zplHost}:${zplPort}: CONEXÃO CAIU após ` +
+              `${socket.bytesWritten} de ${buffer.length} bytes`,
+          )
+          return encerrar(reject, new Error(
+            `A conexão com a impressora "${printerName}" caiu durante o envio ` +
+              `(${socket.bytesWritten} de ${buffer.length} bytes). As etiquetas NÃO saíram.`,
+          ))
+        }
+        if (!escritaConfirmada || socket.bytesWritten < buffer.length) {
+          registrar(
+            `[zpl] ${printerName} via ${zplHost}:${zplPort}: ENVIO INCOMPLETO — ` +
+              `${socket.bytesWritten} de ${buffer.length} bytes`,
+          )
+          return encerrar(reject, new Error(
+            `O envio para "${printerName}" terminou incompleto ` +
+              `(${socket.bytesWritten} de ${buffer.length} bytes). As etiquetas NÃO saíram.`,
+          ))
+        }
         /*
          * ⚠️ O socket NÃO registrava nada (30/10/2026): o winspool ganhou a
          * linha de tempo e este ramo ficou mudo, então 174 envios seguidos
