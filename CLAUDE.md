@@ -11,6 +11,29 @@ manda para a impressora.
 
 ---
 
+## 🚨 A regra que vem antes de tudo (Leonardo, 06/11/2026)
+
+> O FLUXO DE IMPRESSÃO DE ETIQUETA É A PARTE MAIS IMPORTANTE DA EXPEDIÇÃO DO
+> HUB. UMA ETIQUETA DUPLICADA, OU UM LOTE QUE PERDE ETIQUETA NO MEIO, É UM
+> TRANSTORNO E UM ERRO QUE NUNCA PODE ACONTECER.
+
+E a decisão de desenho que vem dela: **este programa recebe o mínimo de
+alteração possível.** Correção que cabe no Hub fica no Hub — lá há deploy,
+rollback e observação; aqui há parque distribuído e versão que fica instalada
+até a próxima conseguir substituí-la.
+
+Em 06/11/2026 uma trava global por `job_uuid` foi escrita aqui como segunda
+camada contra etiqueta em dobro, **medida na Zebra e aprovada nos testes**, e
+ainda assim **revertida**: a causa já estava corrigida no Hub
+(`destino-do-job.ts`), e o `liberar()` deste arquivo não roda em `finally` —
+uma exceção no `confirmar()` prenderia o uuid em TODAS as filas, trocando
+duplicata por **perda**. Proteção que pode prender etiqueta não é proteção.
+
+Antes de propor alteração aqui, responda: *isto não cabe no servidor?* Se
+couber, vá para o servidor.
+
+---
+
 ## 🚨 O que torna este repositório diferente
 
 **Ele roda na máquina de outra pessoa, e se atualiza sozinho.** Não há "fazer
