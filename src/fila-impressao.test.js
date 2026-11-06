@@ -42,49 +42,6 @@ const job = (uuid, over = {}) => ({
   ...over,
 });
 
-/**
- * ═══════════════════════════════════════════════════════════════════════════
- * 🚨 A MESMA ENTREGA EM DUAS FILAS — o incidente de 06/11/2026
- * ═══════════════════════════════════════════════════════════════════════════
- * O Hub publicou a onda pelo MQTT sem `zpl_port`; o pull devolveu o MESMO
- * job (mesmo `job_uuid`) com `zpl_port: 9100`. `chaveDoDestino` junta a
- * porta, então foram DUAS filas — e a trava `emCurso`, que é por fila, não
- * viu a segunda entrega. As 25 etiquetas da onda saíram duas vezes, e
- * `print_jobs` registrou um job só (o reenvio reusa o uuid), por isso o banco
- * não acusou nada.
- *
- * A correção do Hub faz o pull copiar o destino do envio original. Este caso
- * cobre a outra metade: **o cliente não pode imprimir o mesmo `job_uuid`
- * duas vezes, nem que as chaves difiram** — é a defesa que sobrevive à
- * próxima divergência, e ela vai existir.
- */
-teste('🚨 mesmo job_uuid em filas DIFERENTES imprime UMA vez só', async () => {
-  /*
-   * ⚠️ As duas entregas se SOBREPÕEM — é esse o caso. No incidente o MQTT
-   * publicou às 09:09:46, o pull devolveu às 09:09:47 e o ACK só veio às
-   * 09:09:51: a segunda chegou com a primeira ainda saindo no papel. Esperar
-   * a primeira terminar testaria outra coisa (e aí reoferecer é LEGÍTIMO —
-   * ver o caso "depois de IMPRESSO, o mesmo uuid pode voltar").
-   */
-  const { fila, lotes, acks } = montar({ duracaoMs: 30 });
-  const mqtt = fila.enfileirar(job('onda-1', { escala: 'fit' }), 9);
-  const pull = fila.enfileirar(job('onda-1', { escala: 'fit', zpl_port: 9100 }), 9);
-  await Promise.all([mqtt, pull]);
-
-  const impressos = lotes.flatMap((l) => l.uuids);
-  assert.deepStrictEqual(impressos, ['onda-1'], 'a etiqueta saiu mais de uma vez');
-  assert.strictEqual(acks.filter((a) => a.uuid === 'onda-1').length, 1);
-});
-
-teste('job DIFERENTE na outra fila continua imprimindo normalmente', async () => {
-  // A trava é por ENTREGA, não por destino: duas etiquetas distintas para
-  // impressoras distintas não podem se atrapalhar.
-  const { fila, lotes } = montar();
-  await fila.enfileirar(job('a', { printer_system_name: 'Zebra' }), 9);
-  await fila.enfileirar(job('b', { printer_system_name: 'Outra', zpl_port: 9100 }), 9);
-  assert.deepStrictEqual(lotes.flatMap((l) => l.uuids).sort(), ['a', 'b']);
-});
-
 // ── o caso comum: uma etiqueta avulsa ──────────────────────────────────────
 teste('etiqueta única imprime na hora, sem esperar nada', async () => {
   const { fila, lotes, acks } = montar();

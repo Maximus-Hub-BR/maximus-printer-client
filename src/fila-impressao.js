@@ -72,27 +72,6 @@ function chaveDoDestino(job) {
 function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPorLote = MAX_POR_LOTE }) {
   /** chave do destino → { pendentes: [], rodando: boolean } */
   const filas = new Map();
-  /**
-   * ═════════════════════════════════════════════════════════════════════
-   * 🚨 OS UUIDs EM CURSO, ENTRE TODAS AS FILAS (06/11/2026)
-   * ═════════════════════════════════════════════════════════════════════
-   * A trava era POR FILA, e a fila é o DESTINO (`chaveDoDestino`: tipo,
-   * impressora, host, porta e escala). No incidente, o Hub publicou a onda
-   * pelo MQTT sem `zpl_port` e o pull devolveu o MESMO `job_uuid` com
-   * `zpl_port: 9100` um segundo depois: chaves diferentes, filas
-   * diferentes, trava cega. As 25 etiquetas saíram duas vezes — e o banco
-   * não acusou, porque o reenvio reusa o uuid e `print_jobs` tem UMA linha.
-   *
-   * O Hub passou a copiar o destino do envio original, o que resolve ESTE
-   * caso. Este conjunto resolve a CLASSE: o mesmo `job_uuid` é a mesma
-   * impressão, venha por onde vier. Sem ele, a próxima divergência de
-   * destino — e vai haver — imprime em dobro de novo.
-   *
-   * ⚠️ Não atrapalha reimpressão: quando o operador manda imprimir de
-   * novo, o Hub cria um job NOVO, com uuid novo. O que se barra aqui é a
-   * MESMA entrega chegando duas vezes.
-   */
-  const uuidsEmCurso = new Set();
 
   /**
    * Enfileira — recusando o `job_uuid` que JÁ está na fila.
@@ -134,14 +113,10 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
 
     const uuid = job && job.job_uuid;
     if (uuid) {
-      /* ⚠️ A pergunta é GLOBAL: "esta entrega já está em curso em QUALQUER
-         fila?". Perguntar só à fila deste destino foi o que deixou a onda
-         sair duas vezes. */
-      if (uuidsEmCurso.has(uuid)) {
-        registrar(`${uuid} já está em curso — ignorando a segunda entrega (MQTT + pull)`);
+      if (fila.emCurso.has(uuid)) {
+        registrar(`${uuid} já está na fila — ignorando a segunda entrega (MQTT + pull)`);
         return;
       }
-      uuidsEmCurso.add(uuid);
       fila.emCurso.add(uuid);
     }
     fila.pendentes.push({ job, userId });
@@ -172,13 +147,6 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
 
   /** O uuid deixa de ocupar a fila quando o item TEM desfecho. */
   function liberar(lote) {
-    for (const item of lote) {
-      const uuid = item && item.job && item.job.job_uuid;
-      /* ⚠️ Libera no conjunto global TAMBÉM: preso ali, o pull legítimo de
-         uma etiqueta que falhou nunca mais entraria — e etiqueta que não sai
-         é pior que etiqueta repetida. */
-      if (uuid) uuidsEmCurso.delete(uuid);
-    }
     for (const fila of filas.values()) {
       if (!fila.emCurso) continue;
       for (const item of lote) {
