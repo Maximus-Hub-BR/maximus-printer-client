@@ -146,3 +146,26 @@ jobs:
             exit 1
           fi
           gh release upload "$tag" "${arquivos[@]}" --clobber --repo "${{ github.repository }}"
+
+      # 🚨 A RELEASE AINDA NÃO ESTÁ PRONTA PARA O PÚBLICO.
+      #
+      # O DMG deste job é gerado com `CSC_IDENTITY_AUTO_DISCOVERY: false` (o
+      # runner não tem o Developer ID da VCZ), então o Gatekeeper o rejeita.
+      # E os links públicos servem a CÓPIA DE NOME FIXO
+      # (`MHubPrintClient-Setup.dmg` / `.exe`), que ainda não existe para o
+      # Mac — de propósito: publicar uma cópia que o Gatekeeper barra troca
+      # um 404 por um "app danificado".
+      #
+      # O que fecha a publicação é, no Mac do Leonardo:
+      #   npx electron-builder --mac --universal --publish never
+      #   codesign (Developer ID, pelo SHA1) + notarytool + stapler
+      #   gh release upload <tag> <dmg> <zip> <blockmaps> latest-mac.yml --clobber
+      #   # grampear MUDA o hash: recalcular a entrada do .dmg no latest-mac.yml
+      #   scripts/selar-release.sh <versao>      <-- sem isto, o link do Mac é 404
+      #
+      # Em 05/11/2026 a 1.0.31 foi publicada à mão sem esses dois últimos
+      # passos: o DMG ficou sem notarização e os DOIS links públicos deram
+      # 404 por dois dias, sem nada avisar.
+      - name: Avisar que falta selar
+        run: |
+          echo "::warning title=Release incompleta::O .dmg deste job NAO esta notarizado e a copia de nome fixo do Mac nao foi criada. Rode no Mac do Leonardo: electron-builder --mac, codesign+notarytool+stapler, gh release upload --clobber, e scripts/selar-release.sh ${{ inputs.versao }}"

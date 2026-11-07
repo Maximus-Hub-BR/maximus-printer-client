@@ -48,6 +48,41 @@ substituí-la.
 - **A publicação do instalador é manual** (`workflow_dispatch`): criar tag não
   publica binário.
 
+### 🚨 Publicar não acaba no `electron-builder` (07/11/2026)
+
+Os links que a pessoa clica —
+`maximushub.com.br/print-client.dmg` e `.exe` — são 302 para
+`releases/latest/download/MHubPrintClient-Setup.{dmg,exe}`: **nome FIXO, sem
+versão.** O `artifactName` do `package.json` põe a versão no nome, então essa
+**cópia de nome fixo é um ato separado** da publicação, e sem ela o link dá
+404. É cópia, nunca renomeação: o `latest.yml`/`latest-mac.yml` que o
+`electron-updater` consulta aponta para o nome COM versão.
+
+Isso já quebrou duas vezes, pelos dois caminhos possíveis:
+
+| quando | o que aconteceu |
+|---|---|
+| 31/10/2026 | a cópia era subida à mão e existia só na 1.0.21; publicar a 1.0.22 moveu o `latest` e os dois links deram 404 |
+| 05/11/2026 | a 1.0.31 foi publicada à mão **fora do Actions** (o único caminho que criava a cópia do `.exe`); os dois links deram 404 por **dois dias**, e o DMG ficou **sem notarização** |
+
+**O último passo de toda publicação é `scripts/selar-release.sh <versao>`.** Ele
+roda sobre a release já publicada — por qualquer caminho, Actions ou mão —,
+cria as duas cópias e **prova os links públicos** medindo status e tamanho. E
+falha fechado: DMG sem notarização não gera cópia nenhuma, porque um link que
+entrega um DMG que o Gatekeeper chama de "danificado" é pior que um 404.
+
+⚠️ **`spctl` sozinho não prova notarização.** Sem ticket no arquivo ele
+consulta a Apple pela rede e responde `accepted` de qualquer forma (medido em
+07/11/2026). A máquina da expedição pode estar sem internet, e aí só vale o
+ticket **grampeado** — que é o que `xcrun stapler validate` mede. O script
+cobra os dois.
+
+⚠️ **Grampear muda o hash e o tamanho do DMG** (medido: +2.299 bytes), então o
+`latest-mac.yml` tem de ser recalculado DEPOIS do `stapler`. Na 1.0.31 ele
+declarava 184.319.923 para um arquivo de 184.329.477 — o `path` raiz do
+auto-update do Mac aponta para o `.zip`, que estava certo, e foi só por isso
+que o parque continuou atualizando.
+
 ⚠️ **O envio direto à impressora já falhou em SILÊNCIO três vezes num dia** —
 estrutura de dados errada, retorno engolido, e um script achatado numa linha
 só. Nenhuma apareceu como erro: a etiqueta saía pelo caminho antigo e o comando
