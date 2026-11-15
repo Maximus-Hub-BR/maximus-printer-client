@@ -49,7 +49,7 @@
  * @param {boolean} situacao.podeReimprimir      o teto de tentativas permite?
  * @returns {'imprimir'|'reimprimir'|'ja_impresso'|'esgotado'}
  */
-function decidirSobreJob ({ estado, podeReimprimir } = {}) {
+function decidirSobreJob ({ estado, podeReimprimir, controleSeguro = false } = {}) {
   // Nunca vimos: é trabalho novo.
   if (!estado) return 'imprimir';
 
@@ -64,6 +64,7 @@ function decidirSobreJob ({ estado, podeReimprimir } = {}) {
    * repetiria o defeito que este arquivo conserta. Na dúvida, o caminho é o
    * que tem freio E desfecho visível.
    */
+  if (controleSeguro) return 'incerto';
   return podeReimprimir ? 'reimprimir' : 'esgotado';
 }
 
@@ -99,6 +100,11 @@ function aplicarDecisaoDoJob ({ job, userId, decisao, registro, imprimir, regist
     registrar(`[fila] ${uuid} já saiu no papel — reconfirmando, sem imprimir de novo`);
     agendarAcks();
     return decisao;
+  }
+
+  if (decisao === 'incerto') {
+    registro.marcarImpresso(uuid, 'error', 'RESULTADO_INCERTO: o aplicativo foi encerrado durante o envio; confira o lote no Hub.');
+    registro.salvar(); agendarAcks(); return decisao;
   }
 
   if (decisao === 'esgotado') {

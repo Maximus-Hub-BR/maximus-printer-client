@@ -138,6 +138,18 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
     }
   }
 
+  // Só o protocolo novo: um processo encerrado não pode retomar bytes.
+  // O ACK incerto precisa nascer sem depender de uma reentrega que o backend proíbe.
+  let recuperados = false;
+  for (const item of Object.values(dados)) {
+    if (item.controleSeguro && item.estado === 'enviando') {
+      item.estado = 'impresso'; item.status = 'error'; item.confirmado = false;
+      item.erro = 'RESULTADO_INCERTO: aplicativo reiniciado durante o envio; confira o lote no Hub.';
+      recuperados = true;
+    }
+  }
+  if (recuperados) salvar();
+
   return {
     /** Este job já foi para a impressora (com sucesso ou com erro)? */
     jaImprimiu: (jobUuid) => Boolean(jobUuid && dados[jobUuid]),
@@ -167,7 +179,7 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
      * ⚠️ Grava em disco na hora (sem debounce): o ponto inteiro é sobreviver
      * a um fechamento que aconteça nos próximos milissegundos.
      */
-    marcarEnviando(jobUuid) {
+    marcarEnviando(jobUuid, controleSeguro = false, userId = null) {
       if (!jobUuid) return;
       const anterior = dados[jobUuid];
       // Job que já teve desfecho não volta para `enviando`.
@@ -175,6 +187,7 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
       dados[jobUuid] = {
         em: anterior ? anterior.em : agora(),
         estado: 'enviando',
+        ...(controleSeguro ? { controleSeguro: true, userId } : {}),
         status: null,
         erro: null,
         confirmado: false,
@@ -225,6 +238,7 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
       dados[jobUuid] = {
         em: anterior ? anterior.em : agora(),
         estado: 'impresso',
+        ...(anterior?.controleSeguro ? { controleSeguro: true, userId: anterior.userId } : {}),
         status: status === 'error' ? 'error' : 'success',
         erro: erro || null,
         confirmado: anterior ? Boolean(anterior.confirmado) : false,
@@ -253,11 +267,11 @@ function criarRegistroDeImpressao({ ler, gravar, agora = () => Date.now() }) {
     },
 
     /** Os ACKs que o Hub ainda não aceitou — o que vai por HTTP. */
-    pendentesDeConfirmacao() {
+    pendentesDeConfirmacao(userId) {
       return Object.entries(dados)
         // ⚠️ `'enviando'` ainda não tem desfecho: confirmar agora diria ao
         // Hub que saiu uma etiqueta que talvez não tenha saído.
-        .filter(([, item]) => !item.confirmado && item.estado !== 'enviando')
+        .filter(([, item]) => !item.confirmado && item.estado !== 'enviando' && (!item.controleSeguro || Number(item.userId) === Number(userId)))
         .sort((a, b) => a[1].em - b[1].em)
         .map(([job_uuid, item]) => ({ job_uuid, status: item.status, error: item.erro }));
     },
