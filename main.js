@@ -1529,10 +1529,17 @@ async function descobrirImpressoras () {
           intervaloSondagem = Math.max(60000, Math.min(86400000, Number(policy.data?.data?.intervalo_ms) || 86400000))
         } catch (_) { /* backend antigo: descoberta continua sem sondagem */ }
       }
+      // PowerShell é externo ao Electron: não enxerga arquivos dentro do
+      // app.asar. Na bancada Windows de 15/11/2026 isso impediu descobrir
+      // TODAS as filas, embora a sonda funcionasse solta. Materializar os
+      // mesmos bytes em userData mantém desenvolvimento e pacote iguais.
+      const fs = require('fs')
+      const scriptDaSonda = path.join(app.getPath('userData'), 'sonda-impressoras-windows.ps1')
+      fs.writeFileSync(scriptDaSonda, fs.readFileSync(path.join(__dirname, 'src', 'sonda-impressoras-windows.ps1')))
       const consulta = new Promise((resolve, reject) => {
         execFile(
           'powershell',
-          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'src', 'sonda-impressoras-windows.ps1'), ...(sondar ? ['-Sondar', '-TimeoutMs', String(timeoutSondagem)] : [])],
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptDaSonda, ...(sondar ? ['-Sondar', '-TimeoutMs', String(timeoutSondagem)] : [])],
           { timeout: sondar ? 15000 : TETO_DA_DESCOBERTA_MS, windowsHide: true, maxBuffer: 1024 * 1024 },
           (erro, stdout) => (erro ? reject(erro) : resolve(String(stdout))),
         )
