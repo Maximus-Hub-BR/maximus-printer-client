@@ -621,6 +621,26 @@ const filaDeImpressao = criarFilaDeImpressao({
      * gravação de poucos KB por etiqueta; o da alternativa é papel duplo.
      */
     registroDeImpressao.salvar()
+    /*
+     * ⚠️ A janela de DESCONFIANÇA depois do sucesso (15/11/2026): o ACK é
+     * entrega ao caminho de impressão, e a bancada provou que ele convive
+     * com papel que não saiu (fila pausada com o lote no buffer, spool em
+     * erro depois do aceite). Para job CONTROLADO, o observador olha o
+     * destino mais duas vezes e, se houver prova CONTRÁRIA, publica o
+     * DESMENTIDO — quem desfaz a marcação é o BACKEND. Falha aberta: não
+     * saber nunca vira desmentido. E o diário NÃO é tocado: o registro de
+     * envio continua valendo, senão o pull reimprimiria.
+     */
+    if (status === 'success' && item.job.controle?.versao === 1) {
+      observadorPosAck.observar({
+        jobUuid: item.job.job_uuid,
+        userId: item.userId,
+        destino: {
+          impressora: item.job.printer_system_name || null,
+          zplDireto: Boolean(item.job.zpl_host),
+        },
+      })
+    }
     if (!mqttClient || !mqttClient.connected) {
       // Fica pendente de propósito: o HTTP resolve.
       registrar(`[ack] ${item.job.job_uuid}: MQTT offline — fica pendente para o HTTP`)
@@ -653,6 +673,98 @@ const filaDeImpressao = criarFilaDeImpressao({
     )
   },
   registrar: (m) => registrar(`[fila] ${m}`),
+})
+
+// ─── Observador pós-ACK: a prova contrária desmente a confirmação ───────────
+/*
+ * A regra mora em `src/observador-pos-ack.js` (pura, com teste). Aqui ficam
+ * as PONTAS: ler o estado do destino em cada plataforma e publicar o
+ * DESMENTIDO pelo mesmo canal do ACK (MQTT com HTTP de reserva).
+ */
+const {
+  criarObservadorPosAck,
+  evidenciaContraria,
+  interpretarLeituraWindows,
+} = require('./src/observador-pos-ack')
+
+/** Roda um comando e devolve o stdout, ou `null` quando não se sabe. */
+function rodarConsulta (comando, args, opcoes = {}) {
+  const { execFile } = require('child_process')
+  return new Promise((resolve) => {
+    execFile(comando, args, { timeout: 12000, windowsHide: true, ...opcoes }, (erro, stdout) => {
+      resolve(erro ? null : String(stdout || ''))
+    })
+  })
+}
+
+/**
+ * Lê o estado do DESTINO depois do ACK. Devolve `{ evidencia }` — e a régua
+ * do que é prova contrária é a `evidenciaContraria`, compartilhada e testada.
+ *
+ * ⚠️ ZPL por TCP direto (zpl_host) não tem leitura de fila: devolve "não
+ * sei", que não desmente nada (falha aberta).
+ */
+async function consultarEstadoDoDestino (destino) {
+  const impressora = destino && destino.impressora
+  if (!impressora || destino.zplDireto) return { evidencia: null }
+
+  if (process.platform === 'win32') {
+    const nome = String(impressora).replace(/'/g, "''")
+    const ps =
+      `$ErrorActionPreference='Stop';$p=Get-Printer -Name '${nome}';` +
+      `$j=@(Get-PrintJob -PrinterName '${nome}' -ErrorAction SilentlyContinue);` +
+      `[Console]::Out.WriteLine(('{0}|{1}|{2}' -f $p.PrinterStatus,$j.Count,(($j|ForEach-Object{$_.JobStatus}) -join ';')))`
+    const saida = await rodarConsulta('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps])
+    if (saida === null) return { evidencia: null }
+    return { evidencia: evidenciaContraria(interpretarLeituraWindows(saida)) }
+  }
+
+  // macOS/Linux: as mesmas leituras do caminho de impressão (lpstat).
+  const estado = await rodarConsulta('lpstat', argumentosDeEstadoDaFila(impressora))
+  if (estado === null) return { evidencia: null }
+  // ⚠️ `lpstat -o` sem trabalhos sai com código != 0 em alguns sistemas:
+  // isso é "fila vazia", não "não sei" — o mesmo tratamento do caminho de
+  // impressão lá em cima.
+  const pendentes = (await rodarConsulta('lpstat', argumentosDeTrabalhosPendentes(impressora))) || ''
+  return {
+    evidencia: evidenciaContraria({
+      pausada: filaEstaPausada(estado),
+      comProblema: filaReportaProblema(estado),
+      comTrabalho: pendentes.trim().length > 0,
+    }),
+  }
+}
+
+/** DESMENTIDO: mesmo canal do ACK. Nunca lança; perder é voltar ao de hoje. */
+function publicarDesmentido (jobUuid, userId, motivo) {
+  const corpo = { job_uuid: jobUuid, status: 'error', error: `DESMENTIDO: ${motivo}` }
+  const porHttp = async () => {
+    try {
+      await axios.post(
+        `${HUB_API}/print-agents/${garantirAgentUuid()}/acks`,
+        { acks: [corpo] },
+        { headers: { Authorization: `Bearer ${store.get('token')}` }, timeout: 20000 },
+      )
+      registrar(`[pos-ack] desmentido de ${jobUuid} entregue por HTTP`)
+    } catch (erro) {
+      const detalhe = erro && erro.response ? `HTTP ${erro.response.status}` : (erro && erro.message) || erro
+      registrar(`[pos-ack] desmentido de ${jobUuid} não chegou (${detalhe}) — sem nova tentativa`)
+    }
+  }
+  if (mqttClient && mqttClient.connected) {
+    mqttClient.publish(`hub/ack/${userId}/${jobUuid}`, JSON.stringify(corpo), { qos: 1 }, (erro) => {
+      if (erro) void porHttp()
+      else registrar(`[pos-ack] desmentido de ${jobUuid} entregue por MQTT`)
+    })
+    return
+  }
+  void porHttp()
+}
+
+const observadorPosAck = criarObservadorPosAck({
+  consultar: consultarEstadoDoDestino,
+  relatar: publicarDesmentido,
+  registrar: (m) => registrar(`[pos-ack] ${m}`),
 })
 
 // ─── Continuidade: o cliente PUXA o que falta e GARANTE o ACK ───────────────

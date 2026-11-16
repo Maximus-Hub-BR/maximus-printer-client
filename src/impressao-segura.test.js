@@ -38,3 +38,24 @@ test('reinício publica ACK incerto sem depender de nova entrega e respeita usu�
  assert.match(depois.pendentesDeConfirmacao(11)[0].error,/RESULTADO_INCERTO/);assert.deepEqual(depois.pendentesDeConfirmacao(12),[]);
  assert.equal(depois.podeReimprimir('A'),false);
 });
+
+test('o desmentido pós-ACK observa só job CONTROLADO com sucesso, decide no backend e não toca o diário',()=>{
+ const fs=require('fs'),path=require('path');
+ const main=fs.readFileSync(path.join(__dirname,'..','main.js'),'utf8');
+ // 1. O gancho existe no desfecho e é condicionado a sucesso + controle v1.
+ const gancho=main.indexOf("status === 'success' && item.job.controle?.versao === 1");
+ assert.ok(gancho>0,'o observador perdeu a condição de sucesso + controle');
+ assert.ok(/observadorPosAck\.observar\(/.test(main),'o confirmar não agenda a observação');
+ // 2. O desmentido publica com o prefixo que o backend reconhece — e é o
+ //    BACKEND quem desfaz; o cliente não mexe em marcação nenhuma.
+ assert.ok(main.includes('DESMENTIDO: ${motivo}'),'o prefixo DESMENTIDO sumiu do desmentido');
+ // 3. O caminho do desmentido NUNCA escreve no diário: o registro de envio é
+ //    o que impede o pull de reimprimir, e desmentir a marcação não é
+ //    esquecer o envio.
+ const inicio=main.indexOf('function publicarDesmentido');
+ const corpo=main.slice(inicio,main.indexOf('const observadorPosAck'));
+ assert.ok(inicio>0&&corpo.length>0,'publicarDesmentido sumiu do main');
+ assert.ok(!corpo.includes('registroDeImpressao.'),'o desmentido passou a tocar o diário — o pull pode reimprimir');
+ // 4. Falha aberta por desenho: ZPL direto por TCP não tem leitura de fila.
+ assert.ok(/zplDireto\)\s*return \{ evidencia: null \}/.test(main),'o TCP direto deixou de ser "não sei"');
+});
