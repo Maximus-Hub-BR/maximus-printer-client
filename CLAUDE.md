@@ -11,6 +11,29 @@ manda para a impressora.
 
 ---
 
+## 🚨 A regra que vem antes de tudo (Leonardo, 06/11/2026)
+
+> O FLUXO DE IMPRESSÃO DE ETIQUETA É A PARTE MAIS IMPORTANTE DA EXPEDIÇÃO DO
+> HUB. UMA ETIQUETA DUPLICADA, OU UM LOTE QUE PERDE ETIQUETA NO MEIO, É UM
+> TRANSTORNO E UM ERRO QUE NUNCA PODE ACONTECER.
+
+E a decisão de desenho que vem dela: **este programa recebe o mínimo de
+alteração possível.** Correção que cabe no Hub fica no Hub — lá há deploy,
+rollback e observação; aqui há parque distribuído e versão que fica instalada
+até a próxima conseguir substituí-la.
+
+Em 06/11/2026 uma trava global por `job_uuid` foi escrita aqui como segunda
+camada contra etiqueta em dobro, **medida na Zebra e aprovada nos testes**, e
+ainda assim **revertida**: a causa já estava corrigida no Hub
+(`destino-do-job.ts`), e o `liberar()` deste arquivo não roda em `finally` —
+uma exceção no `confirmar()` prenderia o uuid em TODAS as filas, trocando
+duplicata por **perda**. Proteção que pode prender etiqueta não é proteção.
+
+Antes de propor alteração aqui, responda: *isto não cabe no servidor?* Se
+couber, vá para o servidor.
+
+---
+
 ## 🚨 O que torna este repositório diferente
 
 **Ele roda na máquina de outra pessoa, e se atualiza sozinho.** Não há "fazer
@@ -24,6 +47,41 @@ substituí-la.
   mínimo**. O auto-update é como o parque evolui sem visitar máquina a máquina.
 - **A publicação do instalador é manual** (`workflow_dispatch`): criar tag não
   publica binário.
+
+### 🚨 Publicar não acaba no `electron-builder` (07/11/2026)
+
+Os links que a pessoa clica —
+`maximushub.com.br/print-client.dmg` e `.exe` — são 302 para
+`releases/latest/download/MHubPrintClient-Setup.{dmg,exe}`: **nome FIXO, sem
+versão.** O `artifactName` do `package.json` põe a versão no nome, então essa
+**cópia de nome fixo é um ato separado** da publicação, e sem ela o link dá
+404. É cópia, nunca renomeação: o `latest.yml`/`latest-mac.yml` que o
+`electron-updater` consulta aponta para o nome COM versão.
+
+Isso já quebrou duas vezes, pelos dois caminhos possíveis:
+
+| quando | o que aconteceu |
+|---|---|
+| 31/10/2026 | a cópia era subida à mão e existia só na 1.0.21; publicar a 1.0.22 moveu o `latest` e os dois links deram 404 |
+| 05/11/2026 | a 1.0.31 foi publicada à mão **fora do Actions** (o único caminho que criava a cópia do `.exe`); os dois links deram 404 por **dois dias**, e o DMG ficou **sem notarização** |
+
+**O último passo de toda publicação é `scripts/selar-release.sh <versao>`.** Ele
+roda sobre a release já publicada — por qualquer caminho, Actions ou mão —,
+cria as duas cópias e **prova os links públicos** medindo status e tamanho. E
+falha fechado: DMG sem notarização não gera cópia nenhuma, porque um link que
+entrega um DMG que o Gatekeeper chama de "danificado" é pior que um 404.
+
+⚠️ **`spctl` sozinho não prova notarização.** Sem ticket no arquivo ele
+consulta a Apple pela rede e responde `accepted` de qualquer forma (medido em
+07/11/2026). A máquina da expedição pode estar sem internet, e aí só vale o
+ticket **grampeado** — que é o que `xcrun stapler validate` mede. O script
+cobra os dois.
+
+⚠️ **Grampear muda o hash e o tamanho do DMG** (medido: +2.299 bytes), então o
+`latest-mac.yml` tem de ser recalculado DEPOIS do `stapler`. Na 1.0.31 ele
+declarava 184.319.923 para um arquivo de 184.329.477 — o `path` raiz do
+auto-update do Mac aponta para o `.zip`, que estava certo, e foi só por isso
+que o parque continuou atualizando.
 
 ⚠️ **O envio direto à impressora já falhou em SILÊNCIO três vezes num dia** —
 estrutura de dados errada, retorno engolido, e um script achatado numa linha
@@ -77,10 +135,10 @@ de disciplina, e a que mais rende.
 | | onde está escrito |
 |---|---|
 | 🔐 credencial nunca no repositório; produção só aditiva; dry-run antes de escrever | `seguranca/regras.md` |
-| `master` é produção e nada entra sem release; `hotfix` sai de `master` | `padroes/git-flow.md` |
+| `master` é a ÚNICA branch permanente e é o que o Coolify constrói; **todo o caminho é `hub trabalhar` → `hub publicar`** (sem `develop`, sem `release/*`, desde 15/11/2026) | `padroes/fluxo-de-codigo.md` |
 | **"deploy ok" não prova que a correção está no ar** — procure o SÍMBOLO | `playbooks/deploy.md` |
 | teste **verificado desfazendo** | `padroes/testes.md` |
-| **commit seletivo** — `git add <arquivos>`, nunca `git add .` | `padroes/git-flow.md` |
+| **commit seletivo** — `git add <arquivos>`, nunca `git add .` | `padroes/fluxo-de-codigo.md` |
 | português com acentuação em UI, comentários e commits | `padroes/codigo-e-comentarios.md` |
 
 ## 4. Suas particularidades são bem-vindas — e moram à parte
@@ -110,5 +168,7 @@ contornar em silêncio.
 - [ ] carreguei o contexto do brain para o assunto da tarefa
 - [ ] **commit seletivo** — `git add <arquivos>`, nunca `git add .`
 - [ ] teste **verificado desfazendo** (desfiz a correção e o teste falhou)
-- [ ] branch pelo git-flow, e `git log master..<branch>` mostra o TRABALHO
+- [ ] frente aberta com `hub trabalhar <assunto>` (worktree + branch + banco próprio)
+- [ ] `git log origin/master..<branch>` mostra o TRABALHO, não só o bump
+- [ ] publicado com `hub publicar <assunto>` — nunca `git push origin master` à mão
 - [ ] se aprendi algo que não estava escrito: rodei **`/aprender`**
