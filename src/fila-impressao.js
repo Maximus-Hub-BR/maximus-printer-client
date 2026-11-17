@@ -32,8 +32,8 @@
  *    escalas diferentes num PDF só é impossível — a escala vale para o
  *    documento inteiro.
  *
- * 3. **Lote que falha é refeito UM A UM.** Um PDF corrompido no meio não pode
- *    derrubar as outras 24 etiquetas; o erro vira ACK só de quem falhou.
+ * 3. Só falha comprovadamente ANTES do envio pode ser isolada por item.
+ *    Falha depois de possível envio é incerta: repetir duplicaria etiquetas.
  *
  * 4. **ACK sempre, para todo job.** O Hub marca a etiqueta como impressa pelo
  *    ACK; job sem confirmação fica preso na tela do operador para sempre. É a
@@ -49,13 +49,15 @@ const MAX_POR_LOTE = 25;
 
 /** O destino de um job: o que PODE ser impresso na mesma chamada. */
 function chaveDoDestino(job) {
-  return [
+  const partes = [
     job.type === 'zpl' ? 'zpl' : 'pdf',
     job.printer_system_name || '',
     job.zpl_host || '',
     job.zpl_port || '',
     job.escala || '',
-  ].join('|');
+  ];
+  if (job.controle?.versao === 1) partes.push('controle-v1');
+  return partes.join('|');
 }
 
 /**
@@ -164,20 +166,16 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
       liberar(lote);
       return;
     } catch (erro) {
-      // Lote de um só JÁ é o caso individual: não há o que refazer.
-      if (lote.length === 1) {
-        confirmar(lote[0], 'error', erro && erro.message ? erro.message : String(erro));
-        /*
-         * ⚠️ LIBERA também no erro. Sem isto o uuid ficaria ocupando a fila
-         * para sempre e a etiqueta nunca mais entraria — trocando a
-         * duplicata por uma perda, que é pior.
-         */
+      const antes = erro && erro.antesDoEnvio === true;
+      const podeIsolar = antes && lote.length > 1 && lote.every(i => !i.job.controle);
+      if (!podeIsolar) {
+        const prefixo = antes ? 'NAO_ENVIADO:' : 'RESULTADO_INCERTO:';
+        const mensagem = `${prefixo} ${erro && erro.message ? erro.message : String(erro)}`;
+        for (const item of lote) confirmar(item, 'error', mensagem);
         liberar(lote);
         return;
       }
-      registrar(
-        `lote de ${lote.length} falhou (${erro && erro.message ? erro.message : erro}) — refazendo uma a uma`,
-      );
+      registrar(`lote de ${lote.length} falhou antes do envio — isolando documentos`);
     }
     // O erro de uma etiqueta não condena as outras.
     for (const item of lote) await despachar([item]);

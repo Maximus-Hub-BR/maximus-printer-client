@@ -25,7 +25,9 @@ function montar({ falhar = () => false, duracaoMs = 0, maxPorLote } = {}) {
       const uuids = lote.map((i) => i.job.job_uuid);
       if (falhar(lote)) {
         lotes.push({ uuids, ok: false });
-        throw new Error(`falha simulada em ${uuids.join(',')}`);
+        const erro = new Error(`falha simulada em ${uuids.join(',')}`);
+        erro.antesDoEnvio = true; // Este cenário representa preparo de PDF, sem bytes enviados.
+        throw erro;
       }
       lotes.push({ uuids, ok: true });
     },

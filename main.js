@@ -483,9 +483,13 @@ const preparoDeImpressora = criarPreparoDeImpressora({
  * A fila — a regra mora em `src/fila-impressao.js` (pura, com teste). Aqui
  * ficam só as PONTAS: falar com a impressora e publicar o ACK no MQTT.
  */
+let sondagemEmCurso = Promise.resolve()
+let proximaSondagemZpl = 0
+let ultimaDescobertaCups = { texto: '', em: '' }
 const filaDeImpressao = criarFilaDeImpressao({
   imprimir: async (lote) => {
     const { job } = lote[0]
+    await sondagemEmCurso
     /*
      * ══════════════════════════════════════════════════════════════════════
      * 🚨 O REGISTRO VEM ANTES DOS BYTES (30/10/2026)
@@ -500,7 +504,17 @@ const filaDeImpressao = criarFilaDeImpressao({
      * marca toda recuperação como REIMPRESSAO no papel, então o pior caso
      * vira uma etiqueta identificada, não um sósia.
      */
-    for (const item of lote) registroDeImpressao.marcarEnviando(item.job.job_uuid)
+    for (const item of lote) {
+      if (item.job.controle?.versao === 1) registroDeImpressao.marcarEnviando(item.job.job_uuid, true, item.userId)
+    }
+    await require('./src/concessao-de-impressao').obterConcessoes(lote, async (uuid) => {
+      const r = await axios.post(`${HUB_API}/print-agents/${garantirAgentUuid()}/jobs/${uuid}/claim`, {},
+        { headers: { Authorization: `Bearer ${store.get('token')}` }, timeout: 15000 })
+      return r.data?.data?.autorizado === true
+    })
+    for (const item of lote) {
+      if (item.job.controle?.versao !== 1) registroDeImpressao.marcarEnviando(item.job.job_uuid)
+    }
     const buffers = lote.map((i) => Buffer.from(i.job.data, 'base64'))
     // ⚠️ Antes do lote: desliga o backfeed na Zebra, que é o "recalibrar"
     // entre uma etiqueta e outra. Só vale para impressora que fala ZPL e por
@@ -607,6 +621,26 @@ const filaDeImpressao = criarFilaDeImpressao({
      * gravação de poucos KB por etiqueta; o da alternativa é papel duplo.
      */
     registroDeImpressao.salvar()
+    /*
+     * ⚠️ A janela de DESCONFIANÇA depois do sucesso (15/11/2026): o ACK é
+     * entrega ao caminho de impressão, e a bancada provou que ele convive
+     * com papel que não saiu (fila pausada com o lote no buffer, spool em
+     * erro depois do aceite). Para job CONTROLADO, o observador olha o
+     * destino mais duas vezes e, se houver prova CONTRÁRIA, publica o
+     * DESMENTIDO — quem desfaz a marcação é o BACKEND. Falha aberta: não
+     * saber nunca vira desmentido. E o diário NÃO é tocado: o registro de
+     * envio continua valendo, senão o pull reimprimiria.
+     */
+    if (status === 'success' && item.job.controle?.versao === 1) {
+      observadorPosAck.observar({
+        jobUuid: item.job.job_uuid,
+        userId: item.userId,
+        destino: {
+          impressora: item.job.printer_system_name || null,
+          zplDireto: Boolean(item.job.zpl_host),
+        },
+      })
+    }
     if (!mqttClient || !mqttClient.connected) {
       // Fica pendente de propósito: o HTTP resolve.
       registrar(`[ack] ${item.job.job_uuid}: MQTT offline — fica pendente para o HTTP`)
@@ -639,6 +673,98 @@ const filaDeImpressao = criarFilaDeImpressao({
     )
   },
   registrar: (m) => registrar(`[fila] ${m}`),
+})
+
+// ─── Observador pós-ACK: a prova contrária desmente a confirmação ───────────
+/*
+ * A regra mora em `src/observador-pos-ack.js` (pura, com teste). Aqui ficam
+ * as PONTAS: ler o estado do destino em cada plataforma e publicar o
+ * DESMENTIDO pelo mesmo canal do ACK (MQTT com HTTP de reserva).
+ */
+const {
+  criarObservadorPosAck,
+  evidenciaContraria,
+  interpretarLeituraWindows,
+} = require('./src/observador-pos-ack')
+
+/** Roda um comando e devolve o stdout, ou `null` quando não se sabe. */
+function rodarConsulta (comando, args, opcoes = {}) {
+  const { execFile } = require('child_process')
+  return new Promise((resolve) => {
+    execFile(comando, args, { timeout: 12000, windowsHide: true, ...opcoes }, (erro, stdout) => {
+      resolve(erro ? null : String(stdout || ''))
+    })
+  })
+}
+
+/**
+ * Lê o estado do DESTINO depois do ACK. Devolve `{ evidencia }` — e a régua
+ * do que é prova contrária é a `evidenciaContraria`, compartilhada e testada.
+ *
+ * ⚠️ ZPL por TCP direto (zpl_host) não tem leitura de fila: devolve "não
+ * sei", que não desmente nada (falha aberta).
+ */
+async function consultarEstadoDoDestino (destino) {
+  const impressora = destino && destino.impressora
+  if (!impressora || destino.zplDireto) return { evidencia: null }
+
+  if (process.platform === 'win32') {
+    const nome = String(impressora).replace(/'/g, "''")
+    const ps =
+      `$ErrorActionPreference='Stop';$p=Get-Printer -Name '${nome}';` +
+      `$j=@(Get-PrintJob -PrinterName '${nome}' -ErrorAction SilentlyContinue);` +
+      `[Console]::Out.WriteLine(('{0}|{1}|{2}' -f $p.PrinterStatus,$j.Count,(($j|ForEach-Object{$_.JobStatus}) -join ';')))`
+    const saida = await rodarConsulta('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps])
+    if (saida === null) return { evidencia: null }
+    return { evidencia: evidenciaContraria(interpretarLeituraWindows(saida)) }
+  }
+
+  // macOS/Linux: as mesmas leituras do caminho de impressão (lpstat).
+  const estado = await rodarConsulta('lpstat', argumentosDeEstadoDaFila(impressora))
+  if (estado === null) return { evidencia: null }
+  // ⚠️ `lpstat -o` sem trabalhos sai com código != 0 em alguns sistemas:
+  // isso é "fila vazia", não "não sei" — o mesmo tratamento do caminho de
+  // impressão lá em cima.
+  const pendentes = (await rodarConsulta('lpstat', argumentosDeTrabalhosPendentes(impressora))) || ''
+  return {
+    evidencia: evidenciaContraria({
+      pausada: filaEstaPausada(estado),
+      comProblema: filaReportaProblema(estado),
+      comTrabalho: pendentes.trim().length > 0,
+    }),
+  }
+}
+
+/** DESMENTIDO: mesmo canal do ACK. Nunca lança; perder é voltar ao de hoje. */
+function publicarDesmentido (jobUuid, userId, motivo) {
+  const corpo = { job_uuid: jobUuid, status: 'error', error: `DESMENTIDO: ${motivo}` }
+  const porHttp = async () => {
+    try {
+      await axios.post(
+        `${HUB_API}/print-agents/${garantirAgentUuid()}/acks`,
+        { acks: [corpo] },
+        { headers: { Authorization: `Bearer ${store.get('token')}` }, timeout: 20000 },
+      )
+      registrar(`[pos-ack] desmentido de ${jobUuid} entregue por HTTP`)
+    } catch (erro) {
+      const detalhe = erro && erro.response ? `HTTP ${erro.response.status}` : (erro && erro.message) || erro
+      registrar(`[pos-ack] desmentido de ${jobUuid} não chegou (${detalhe}) — sem nova tentativa`)
+    }
+  }
+  if (mqttClient && mqttClient.connected) {
+    mqttClient.publish(`hub/ack/${userId}/${jobUuid}`, JSON.stringify(corpo), { qos: 1 }, (erro) => {
+      if (erro) void porHttp()
+      else registrar(`[pos-ack] desmentido de ${jobUuid} entregue por MQTT`)
+    })
+    return
+  }
+  void porHttp()
+}
+
+const observadorPosAck = criarObservadorPosAck({
+  consultar: consultarEstadoDoDestino,
+  relatar: publicarDesmentido,
+  registrar: (m) => registrar(`[pos-ack] ${m}`),
 })
 
 // ─── Continuidade: o cliente PUXA o que falta e GARANTE o ACK ───────────────
@@ -706,7 +832,7 @@ function agendarAcksPendentes () {
  * resultado), então reenviar é seguro — é o que permite insistir.
  */
 async function enviarAcksPendentes () {
-  const pendentes = registroDeImpressao.pendentesDeConfirmacao()
+  const pendentes = registroDeImpressao.pendentesDeConfirmacao(store.get('user_id'))
   if (!pendentes.length) return
   const token = store.get('token')
   if (!token) return
@@ -838,6 +964,7 @@ function enfileirar (job, userId) {
     decisao: decidirSobreJob({
       estado: registroDeImpressao.estadoDe(uuid),
       podeReimprimir: registroDeImpressao.podeReimprimir(uuid),
+      controleSeguro: job.controle?.versao === 1,
     }),
     registro: registroDeImpressao,
     imprimir: (j, u) => filaDeImpressao.enfileirar(j, u),
@@ -988,7 +1115,7 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
       // ⚠️ RELANÇA quando é lote: `imprimirLote` refaz uma a uma e cada uma
       // cai no seu próprio fallback. Engolir aqui imprimiria o lote inteiro
       // com a escala errada.
-      if (lista.length > 1) throw e
+      if (lista.length > 1) { e.antesDoEnvio = true; throw e }
       registrar(`[pdf] transformarPdf falhou (${e.message}) — fallback fit`)
       bufferFinal = lista[0]
       escalaSumatra = 'fit'
@@ -1000,10 +1127,10 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
     fs.writeFileSync(probe, lista[0])
     escalaSumatra = decidirEscalaAuto(probe)
     try { fs.unlinkSync(probe) } catch (_) {}
-    if (lista.length > 1) bufferFinal = await juntarPdfs(lista)
+    if (lista.length > 1) { try { bufferFinal = await juntarPdfs(lista) } catch (e) { e.antesDoEnvio = true; throw e } }
   } else {
     escalaSumatra = cfg.mode // noscale | shrink | fit diretos
-    if (lista.length > 1) bufferFinal = await juntarPdfs(lista)
+    if (lista.length > 1) { try { bufferFinal = await juntarPdfs(lista) } catch (e) { e.antesDoEnvio = true; throw e } }
   }
 
   const file = path.join(tmp, `mhub_${Date.now()}.pdf`)
@@ -1502,14 +1629,36 @@ async function descobrirImpressoras () {
        * derrubava a conexão MQTT durante a impressão (ver `imprimirZpl`).
        */
       const { execFile } = require('child_process')
-      const raw = await new Promise((resolve, reject) => {
+      let sondar = false
+      let intervaloSondagem = 86400000
+      let timeoutSondagem = 3000
+      if (!filaDeImpressao.ocupada() && Date.now() >= proximaSondagemZpl) {
+        try {
+          const policy = await axios.get(`${HUB_API}/print-agents/${garantirAgentUuid()}/capabilities-policy`,
+            { headers: { Authorization: `Bearer ${store.get('token')}` }, timeout: 5000 })
+          sondar = policy.data?.data?.sondar_zpl === true && !filaDeImpressao.ocupada()
+          timeoutSondagem = Math.max(500, Math.min(5000, Number(policy.data?.data?.timeout_ms) || 3000))
+          intervaloSondagem = Math.max(60000, Math.min(86400000, Number(policy.data?.data?.intervalo_ms) || 86400000))
+        } catch (_) { /* backend antigo: descoberta continua sem sondagem */ }
+      }
+      // PowerShell é externo ao Electron: não enxerga arquivos dentro do
+      // app.asar. Na bancada Windows de 15/11/2026 isso impediu descobrir
+      // TODAS as filas, embora a sonda funcionasse solta. Materializar os
+      // mesmos bytes em userData mantém desenvolvimento e pacote iguais.
+      const fs = require('fs')
+      const scriptDaSonda = path.join(app.getPath('userData'), 'sonda-impressoras-windows.ps1')
+      fs.writeFileSync(scriptDaSonda, fs.readFileSync(path.join(__dirname, 'src', 'sonda-impressoras-windows.ps1')))
+      const consulta = new Promise((resolve, reject) => {
         execFile(
           'powershell',
-          ['-NoProfile', '-Command', 'Get-Printer | Select-Object Name | ConvertTo-Json'],
-          { timeout: TETO_DA_DESCOBERTA_MS, windowsHide: true, maxBuffer: 1024 * 1024 },
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptDaSonda, ...(sondar ? ['-Sondar', '-TimeoutMs', String(timeoutSondagem)] : [])],
+          { timeout: sondar ? 15000 : TETO_DA_DESCOBERTA_MS, windowsHide: true, maxBuffer: 1024 * 1024 },
           (erro, stdout) => (erro ? reject(erro) : resolve(String(stdout))),
         )
       })
+      if (sondar) sondagemEmCurso = consulta.catch(() => {})
+      const raw = await consulta
+      if (sondar) proximaSondagemZpl = Date.now() + intervaloSondagem
       const parsed = JSON.parse(raw)
       const list = Array.isArray(parsed) ? parsed : [parsed]
       // ⚠️ O número entra no log: "não puxou impressora" e "o PC não tem
@@ -1520,6 +1669,7 @@ async function descobrirImpressoras () {
         system_name:  p.Name,
         display_name: p.Name,
         type:         detectarTipoImpressora(p.Name),
+        capabilities: p.capabilities,
       }))
     } else {
       const { execFileSync } = require('child_process')
@@ -1531,10 +1681,29 @@ async function descobrirImpressoras () {
         // stdout vazio é lista vazia — não é falha da descoberta.
         raw = e.stdout ? String(e.stdout) : ''
       }
+      let capacidades = new Map()
+      try {
+        const { execFile } = require('child_process')
+        const ler = (cmd, args) => new Promise((resolve, reject) => execFile(cmd, args,
+          { timeout: 5000, maxBuffer: 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } },
+          (erro, stdout) => erro ? reject(erro) : resolve(stdout)))
+        // Relê o destino em todo sync: trocar a URI invalida a prova anterior.
+        const filas = await ler('lpstat', ['-v'])
+        if (!filaDeImpressao.ocupada() && Date.now() >= proximaSondagemZpl) {
+          const policy = await axios.get(`${HUB_API}/print-agents/${garantirAgentUuid()}/capabilities-policy`,
+            { headers: { Authorization: `Bearer ${store.get('token')}` }, timeout: 5000 })
+          if (policy.data?.data?.sondar_zpl === true) {
+            ultimaDescobertaCups = { texto: await ler('lpinfo', ['--include-schemes', 'usb', '-l', '-v']), em: new Date().toISOString() }
+            proximaSondagemZpl = Date.now() + Math.max(60000, Math.min(86400000, Number(policy.data?.data?.intervalo_ms) || 86400000))
+          } else ultimaDescobertaCups = { texto: '', em: '' }
+        }
+        capacidades = require('./src/capacidade-cups').observacoesCups(filas, ultimaDescobertaCups.texto, ultimaDescobertaCups.em)
+      } catch (_) { /* Falha de descoberta não prova suporte nem renova sua validade. */ }
       return interpretarLpstat(raw).map(name => ({
         system_name:  name,
         display_name: name,
         type:         detectarTipoImpressora(name),
+        ...(capacidades.has(name) ? { capabilities: capacidades.get(name) } : {}),
       }))
     }
   } catch (err) {
@@ -1953,7 +2122,7 @@ async function tentarReinicioAutomatico () {
 }
 
 async function avaliarReinicio () {
-  const pendentesDeAck = registroDeImpressao.pendentesDeConfirmacao().length
+  const pendentesDeAck = registroDeImpressao.pendentesDeConfirmacao(store.get('user_id')).length
   const { reiniciar, motivo } = decidirReinicio({
     baixado: updateDownloaded,
     obrigatoria: atualizacaoObrigatoria,
