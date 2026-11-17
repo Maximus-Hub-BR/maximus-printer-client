@@ -135,10 +135,10 @@ de disciplina, e a que mais rende.
 | | onde está escrito |
 |---|---|
 | 🔐 credencial nunca no repositório; produção só aditiva; dry-run antes de escrever | `seguranca/regras.md` |
-| `master` é produção e nada entra sem release; `hotfix` sai de `master` | `padroes/git-flow.md` |
+| `master` é a ÚNICA branch permanente e é o que o Coolify constrói; **todo o caminho é `hub trabalhar` → `hub publicar`** (sem `develop`, sem `release/*`, desde 15/11/2026) | `padroes/fluxo-de-codigo.md` |
 | **"deploy ok" não prova que a correção está no ar** — procure o SÍMBOLO | `playbooks/deploy.md` |
 | teste **verificado desfazendo** | `padroes/testes.md` |
-| **commit seletivo** — `git add <arquivos>`, nunca `git add .` | `padroes/git-flow.md` |
+| **commit seletivo** — `git add <arquivos>`, nunca `git add .` | `padroes/fluxo-de-codigo.md` |
 | português com acentuação em UI, comentários e commits | `padroes/codigo-e-comentarios.md` |
 
 ## 4. Suas particularidades são bem-vindas — e moram à parte
@@ -168,5 +168,7 @@ contornar em silêncio.
 - [ ] carreguei o contexto do brain para o assunto da tarefa
 - [ ] **commit seletivo** — `git add <arquivos>`, nunca `git add .`
 - [ ] teste **verificado desfazendo** (desfiz a correção e o teste falhou)
-- [ ] branch pelo git-flow, e `git log master..<branch>` mostra o TRABALHO
+- [ ] frente aberta com `hub trabalhar <assunto>` (worktree + branch + banco próprio)
+- [ ] `git log origin/master..<branch>` mostra o TRABALHO, não só o bump
+- [ ] publicado com `hub publicar <assunto>` — nunca `git push origin master` à mão
 - [ ] se aprendi algo que não estava escrito: rodei **`/aprender`**
