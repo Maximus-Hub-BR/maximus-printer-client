@@ -6,7 +6,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test src/*.test.js",
+    "test": "node --test src/",
     "build:win": "electron-builder --win --x64",
     "build:mac": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --universal",
     "packagePublish": "electron-builder --win --x64 --publish always"
