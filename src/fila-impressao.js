@@ -27,10 +27,35 @@
  *    seguinte. Quanto maior a rajada, maior o lote — e não há temporizador
  *    para calibrar nem latência artificial para explicar depois.
  *
- * 2. **Uma fila por DESTINO** (impressora + tipo + escala). Fila única
- *    serializaria duas impressoras que podiam trabalhar em paralelo; e juntar
- *    escalas diferentes num PDF só é impossível — a escala vale para o
- *    documento inteiro.
+ * 2. **Uma fila por IMPRESSORA FÍSICA; o LOTE é por destino.** São duas
+ *    perguntas diferentes, e durante um ano elas tiveram uma resposta só:
+ *
+ *      - *quem espera quem?* → a impressora física (fila + host:porta). Duas
+ *        impressoras trabalham em paralelo; a MESMA, nunca.
+ *      - *o que cabe na mesma chamada?* → o destino (`chaveDoDestino`: tipo,
+ *        escala, controle). Juntar escalas diferentes num PDF só é
+ *        impossível — a escala vale para o documento inteiro.
+ *
+ *    🚨 **Fundir as duas custou etiqueta (medido em 23/11/2026).** Enquanto a
+ *    fila era indexada por destino, dois jobs para a MESMA impressora com
+ *    tipo ou escala diferentes caíam em filas distintas e disparavam `lp`
+ *    CONCORRENTE na mesma fila do CUPS. Na bancada, 3 chamadas no mesmo
+ *    segundo (~120 KB de ZPL) saíram como **UMA** etiqueta: o CUPS aceitou as
+ *    três, a fila ficou vazia e ociosa, e não houve erro em lugar nenhum —
+ *    ACEITO ≠ IMPRESSO, sem rastro.
+ *
+ *    O caminho real que produzia isso já estava documentado em
+ *    `backend-novo/src/impressao/destino-do-job.ts`: a bipada do **picking**
+ *    imprime SEM `escala` e a onda/avulso COM — mesma impressora da
+ *    expedição, duas filas. Bipar um pedido enquanto a onda saía era o
+ *    bastante. Irmão do incidente de 06/11/2026 (a onda em dobro), com a
+ *    MESMA raiz — "o destino define a fila" — e um estrago diferente: lá a
+ *    trava `emCurso` não via a segunda entrega; aqui a impressora recebe duas
+ *    conversas ao mesmo tempo.
+ *
+ *    ⚠️ O lote segue sendo um **prefixo contíguo** de mesma `chaveDoDestino`,
+ *    nunca um filtro que varre a fila: a ordem de chegada é a ordem do papel,
+ *    e a expedição confere o papel contra a lista da tela.
  *
  * 3. Só falha comprovadamente ANTES do envio pode ser isolada por item.
  *    Falha depois de possível envio é incerta: repetir duplicaria etiquetas.
@@ -46,6 +71,37 @@
 
 /** Teto de etiquetas por lote — o mesmo `MAX_POR_BLOCO` do servidor. */
 const MAX_POR_LOTE = 25;
+
+/**
+ * A IMPRESSORA FÍSICA de um job — quem espera quem. É a chave da FILA.
+ *
+ * ⚠️ De propósito NÃO inclui `type`, `escala` nem `controle`: esses dizem o
+ * que cabe na mesma chamada (`chaveDoDestino`), não quem compartilha o
+ * aparelho. Acrescentar qualquer um deles aqui reabre o `lp` concorrente.
+ */
+function chaveDaImpressora(job) {
+  /*
+   * 🚨 A PORTA SÓ EXISTE QUANDO HÁ HOST — e ignorá-la é o que fecha o caso
+   * `onda` × `avulso` (23/11/2026).
+   *
+   * `backend-novo/src/impressao/destino-do-job.ts` manda `zpl_host`/`zpl_port`
+   * no avulso e no picking, e NUNCA na onda — decisão consciente de
+   * 06/11/2026, registrada lá: *"incluí-los agora juntaria a fila da onda com
+   * a do avulso no cliente"*. Resultado prático na mesma Zebra:
+   *
+   *     onda    → printer_system_name=Zebra, sem host, sem porta
+   *     avulso  → printer_system_name=Zebra, host=null, porta=9100
+   *
+   * Se a porta entrasse na chave, esses dois seriam aparelhos diferentes — e
+   * o lote em curso mais um clique em "Imprimir" voltariam a disputar o mesmo
+   * `lp`. Mas `zpl_port` SEM `zpl_host` não imprime nada por socket: o
+   * cliente só abre conexão quando tem host (e nenhuma das 184 impressoras
+   * cadastradas tem). Sem host, o papel sai pelo CUPS, e quem identifica o
+   * aparelho é a FILA DO SISTEMA, sozinha.
+   */
+  const porSocket = job.zpl_host ? `${job.zpl_host}:${job.zpl_port || 9100}` : '';
+  return porSocket || `cups:${job.printer_system_name || ''}`;
+}
 
 /** O destino de um job: o que PODE ser impresso na mesma chamada. */
 function chaveDoDestino(job) {
@@ -108,7 +164,7 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
    * `splice` e a impressão.
    */
   function enfileirar(job, userId) {
-    const chave = chaveDoDestino(job);
+    const chave = chaveDaImpressora(job);
     if (!filas.has(chave)) filas.set(chave, { pendentes: [], rodando: false, emCurso: new Set() });
     const fila = filas.get(chave);
     if (!fila.emCurso) fila.emCurso = new Set();
@@ -131,8 +187,24 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
     fila.rodando = true;
     try {
       while (fila.pendentes.length) {
-        // Leva TUDO que se acumulou enquanto o lote anterior saía no papel.
-        const lote = fila.pendentes.splice(0, maxPorLote);
+        /*
+         * Leva o que se acumulou enquanto o lote anterior saía no papel — mas
+         * só enquanto o DESTINO não muda.
+         *
+         * ⚠️ Prefixo contíguo, não filtro: a fila da impressora pode ter
+         * [pdf, zpl, pdf], e varrer por tipo mandaria os dois pdf juntos,
+         * pondo a 3ª etiqueta no papel antes da 2ª. A ordem de chegada é a
+         * ordem do papel. Destino diferente não é descartado nem adiado: ele
+         * é o lote da volta seguinte do laço, imprimindo logo depois.
+         */
+        const destino = chaveDoDestino(fila.pendentes[0].job);
+        let quantos = 1;
+        while (
+          quantos < maxPorLote &&
+          quantos < fila.pendentes.length &&
+          chaveDoDestino(fila.pendentes[quantos].job) === destino
+        ) quantos += 1;
+        const lote = fila.pendentes.splice(0, quantos);
         await despachar(lote);
       }
     } finally {
@@ -184,6 +256,7 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
   return {
     enfileirar,
     chaveDoDestino,
+    chaveDaImpressora,
     /**
      * Há trabalho em curso? (pendente OU já no lote que está imprimindo)
      *
@@ -201,7 +274,7 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
       return false;
     },
 
-    /** Só para teste e diagnóstico: quantos jobs esperam em cada destino. */
+    /** Só para teste e diagnóstico: quantos jobs esperam em cada IMPRESSORA. */
     pendentes: () => {
       const fora = {};
       for (const [chave, fila] of filas) fora[chave] = fila.pendentes.length;
@@ -210,4 +283,4 @@ function criarFilaDeImpressao({ imprimir, confirmar, registrar = () => {}, maxPo
   };
 }
 
-module.exports = { criarFilaDeImpressao, chaveDoDestino, MAX_POR_LOTE };
+module.exports = { criarFilaDeImpressao, chaveDoDestino, chaveDaImpressora, MAX_POR_LOTE };

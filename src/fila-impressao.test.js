@@ -7,7 +7,7 @@
  * nenhuma etiqueta se perde, nenhuma sai fora de ordem, e toda uma recebe ACK.
  */
 const assert = require('assert');
-const { criarFilaDeImpressao, chaveDoDestino } = require('./fila-impressao');
+const { criarFilaDeImpressao, chaveDoDestino, chaveDaImpressora } = require('./fila-impressao');
 
 let passaram = 0;
 const casos = [];
@@ -18,10 +18,39 @@ const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
 function montar({ falhar = () => false, duracaoMs = 0, maxPorLote } = {}) {
   const lotes = [];
   const acks = [];
+  /*
+   * 🚨 Quantas chamadas estão DENTRO do `imprimir` ao mesmo tempo, por
+   * impressora física. É o que o `lp` concorrente faz, e o que nenhum teste
+   * media antes de 23/11/2026: a fila dizia "serializo" e serializava — por
+   * destino, não por aparelho.
+   */
+  const dentro = new Map();
+  /*
+   * ⚠️ DOIS picos, porque são duas perguntas opostas:
+   *   `pico`  — a MAIOR concorrência numa MESMA impressora. Tem de ser 1.
+   *   `total` — quantas impressoras trabalham juntas. Tem de ser > 1 quando
+   *             há mais de um aparelho, senão a correção virou fila única e
+   *             a expedição perdeu o paralelismo das bancadas.
+   * Medir só o primeiro deixaria passar exatamente esse estrago.
+   */
+  let emVoo = 0;
+  const concorrencia = { pico: 0, total: 0, porImpressora: {} };
   const fila = criarFilaDeImpressao({
     maxPorLote,
     imprimir: async (lote) => {
-      if (duracaoMs) await pausa(duracaoMs);
+      const alvo = aparelhoReal(lote[0].job);
+      const agora = (dentro.get(alvo) || 0) + 1;
+      dentro.set(alvo, agora);
+      emVoo += 1;
+      concorrencia.pico = Math.max(concorrencia.pico, agora);
+      concorrencia.total = Math.max(concorrencia.total, emVoo);
+      concorrencia.porImpressora[alvo] = Math.max(concorrencia.porImpressora[alvo] || 0, agora);
+      try {
+        if (duracaoMs) await pausa(duracaoMs);
+      } finally {
+        dentro.set(alvo, (dentro.get(alvo) || 1) - 1);
+        emVoo -= 1;
+      }
       const uuids = lote.map((i) => i.job.job_uuid);
       if (falhar(lote)) {
         lotes.push({ uuids, ok: false });
@@ -33,8 +62,23 @@ function montar({ falhar = () => false, duracaoMs = 0, maxPorLote } = {}) {
     },
     confirmar: (item, status, erro) => acks.push({ uuid: item.job.job_uuid, status, erro }),
   });
-  return { fila, lotes, acks };
+  return { fila, lotes, acks, concorrencia };
 }
+
+/*
+ * 🚨 O APARELHO FÍSICO, calculado NO TESTE — nunca por `chaveDaImpressora`.
+ *
+ * Medir a concorrência com a função sob teste foi um erro cometido em
+ * 23/11/2026: com a porta dentro da chave, `onda` (sem porta) e `avulso`
+ * (porta 9100) viravam dois contadores diferentes, cada um com pico 1 — e o
+ * teste dava VERDE sobre exatamente o defeito que existia para provar. O
+ * instrumento concorda com o erro quando compartilha a premissa dele.
+ *
+ * Aqui a regra é a física: o papel sai por SOCKET quando há host; sem host,
+ * sai pela fila do CUPS, e `zpl_port` não toca em nada.
+ */
+const aparelhoReal = (j) =>
+  j.zpl_host ? `socket:${j.zpl_host}` : `cups:${j.printer_system_name || ''}`;
 
 const job = (uuid, over = {}) => ({
   job_uuid: uuid,
@@ -107,6 +151,100 @@ teste('ZPL e PDF nunca se misturam', () => {
   assert.notStrictEqual(chaveDoDestino(job('a', { type: 'zpl' })), chaveDoDestino(job('b')));
 });
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 🚨 UMA IMPRESSORA, UMA CONVERSA (23/11/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * Estes casos são a prova do que a fila por DESTINO não garantia. Desfaça a
+ * correção (volte o `enfileirar` a indexar por `chaveDoDestino`) e eles ficam
+ * VERMELHOS — é o que os torna teste, e não enfeite.
+ */
+teste('🚨 destinos diferentes na MESMA impressora NÃO imprimem ao mesmo tempo', async () => {
+  const { fila, concorrencia } = montar({ duracaoMs: 30 });
+  // o que a expedição faz: a onda sai (PDF com escala) e alguém bipa no
+  // picking (PDF sem escala). Mesma Zebra, destinos diferentes.
+  const daOnda = fila.enfileirar(job('onda', { escala: 'label' }), 9);
+  const doPicking = fila.enfileirar(job('picking'), 9);
+  await Promise.all([daOnda, doPicking]);
+  assert.strictEqual(concorrencia.pico, 1,
+    `a mesma impressora recebeu ${concorrencia.pico} chamadas simultâneas`);
+});
+
+teste('🚨 ZPL e PDF na MESMA impressora também se esperam', async () => {
+  const { fila, concorrencia } = montar({ duracaoMs: 30 });
+  await Promise.all([
+    fila.enfileirar(job('zpl', { type: 'zpl' }), 9),
+    fila.enfileirar(job('pdf'), 9),
+  ]);
+  assert.strictEqual(concorrencia.pico, 1);
+});
+
+teste('🚨 onda e avulso na MESMA Zebra NÃO disputam o lp (a porta não separa)', async () => {
+  const { fila, concorrencia } = montar({ duracaoMs: 30 });
+  /*
+   * O caso mais comum da expedição: a onda está saindo e alguém clica
+   * "Imprimir" num pedido. O servidor manda a onda SEM host/porta e o avulso
+   * COM `zpl_port: 9100` (destino-do-job.ts) — mas sem host nada vai por
+   * socket: as duas saem pela MESMA fila do CUPS.
+   */
+  await Promise.all([
+    fila.enfileirar(job('onda', { escala: 'label' }), 9),
+    fila.enfileirar(job('avulso', { escala: 'label', zpl_host: null, zpl_port: 9100 }), 9),
+  ]);
+  assert.strictEqual(concorrencia.pico, 1,
+    `onda e avulso rodaram juntos na mesma impressora (${concorrencia.pico} chamadas)`);
+});
+
+teste('⚠️ impressora de REDE (com host) continua sendo outro aparelho', async () => {
+  const { fila, concorrencia } = montar({ duracaoMs: 30 });
+  // prova NEGATIVA da regra acima: com host, o socket é o destino real, e uma
+  // Zebra de rede não pode ser serializada contra a fila local do mesmo nome.
+  await Promise.all([
+    fila.enfileirar(job('local', {}), 9),
+    fila.enfileirar(job('rede', { zpl_host: '10.1.1.50', zpl_port: 9100 }), 9),
+  ]);
+  assert.strictEqual(concorrencia.total, 2, 'a de rede e a local deviam ir em paralelo');
+  assert.strictEqual(concorrencia.pico, 1);
+});
+
+teste('impressoras diferentes CONTINUAM em paralelo', async () => {
+  const { fila, concorrencia } = montar({ duracaoMs: 30 });
+  await Promise.all([
+    fila.enfileirar(job('a', { printer_system_name: 'Zebra-1' }), 9),
+    fila.enfileirar(job('b', { printer_system_name: 'Zebra-2' }), 9),
+  ]);
+  // prova POSITIVA: se a correção tivesse virado fila única, `total` daria 1 e
+  // a expedição perderia o paralelismo das duas bancadas.
+  assert.strictEqual(concorrencia.total, 2, 'as duas impressoras não trabalharam juntas');
+  assert.strictEqual(concorrencia.pico, 1, 'nenhuma impressora recebeu duas chamadas');
+  assert.strictEqual(concorrencia.porImpressora['cups:Zebra-1'], 1);
+  assert.strictEqual(concorrencia.porImpressora['cups:Zebra-2'], 1);
+});
+
+teste('destinos intercalados saem na ORDEM de chegada, sem misturar o lote', async () => {
+  const { fila, lotes } = montar({ duracaoMs: 20 });
+  // [pdf, zpl, pdf] na mesma impressora: varrer por tipo mandaria os dois pdf
+  // juntos e poria a 3ª no papel antes da 2ª.
+  const todos = [
+    fila.enfileirar(job('1'), 9),
+    fila.enfileirar(job('2', { type: 'zpl' }), 9),
+    fila.enfileirar(job('3'), 9),
+  ];
+  await Promise.all(todos);
+  assert.deepStrictEqual(lotes.flatMap((l) => l.uuids), ['1', '2', '3']);
+  for (const l of lotes) assert.strictEqual(l.uuids.length, 1, 'tipos não podem ir no mesmo lote');
+});
+
+teste('a rajada de MESMO destino continua virando UM lote', async () => {
+  const { fila, lotes } = montar({ duracaoMs: 30 });
+  const primeiro = fila.enfileirar(job('a'), 9);
+  await pausa(5);
+  const resto = [fila.enfileirar(job('b'), 9), fila.enfileirar(job('c'), 9)];
+  await Promise.all([primeiro, ...resto]);
+  // a economia de 09/10 não pode ter sido desfeita pela correção
+  assert.deepStrictEqual(lotes.map((l) => l.uuids), [['a'], ['b', 'c']]);
+});
+
 // ── falha ──────────────────────────────────────────────────────────────────
 /**
  * ⚠️ A promessa que protege a expedição: um PDF corrompido no meio não pode
@@ -170,7 +308,7 @@ teste('job que chega no fecho do ciclo não fica preso', async () => {
   // Fila já ociosa: o próximo tem de disparar sozinho.
   await fila.enfileirar(job('b'), 9);
   assert.deepStrictEqual(lotes.flatMap((l) => l.uuids), ['a', 'b']);
-  assert.deepStrictEqual(fila.pendentes(), { 'pdf|Zebra|||': 0 });
+  assert.deepStrictEqual(fila.pendentes(), { [chaveDaImpressora(job('zzz'))]: 0 });
 });
 
 teste('nada fica pendente ao fim de uma rajada', async () => {
