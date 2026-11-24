@@ -1,6 +1,6 @@
 {
   "name": "maximushub-print-client",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "MaximusHub Print Client — impressão local via MQTT",
   "author": "MaximusHub",
   "main": "main.js",
